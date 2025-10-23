@@ -1,0 +1,15 @@
+[package]
+name = "logdiver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui = "0.29.0"
+anyhow = "1.0.100"
+notify = "8.2.0"
+rayon = "1.11.0"
+indexmap ="1.9.3"
+gjson = "0.8.1"
+clap = {version = "4.5.50", features = ["derive"]}
+memchr = "2.7.6"
