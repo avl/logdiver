@@ -5,8 +5,9 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
 use std::thread::available_parallelism;
 use std::time::Duration;
 use anyhow::Result;
@@ -18,6 +19,9 @@ use ratatui::{DefaultTerminal, Frame};
 
 use clap::{Parser, Subcommand};
 use clap::parser::Values;
+use ratatui::layout::Constraint::Percentage;
+use ratatui::prelude::{Color, Style, Stylize};
+use ratatui::widgets::{Block, Borders, Row, Table, TableState};
 use crate::trie::Trie;
 
 #[derive(Debug, Parser)]
@@ -222,9 +226,9 @@ mod trie {
                     }
 
                     map.visit(|haystack_key, haystack_value|{
-                        println!("Matching key: {:?} against {:?}", haystack_key, key);
+                        //println!("Matching key: {:?} against {:?}", haystack_key, key);
                         if let Some(index) = memchr(haystack_key, &key[0..]) {
-                            println!("Found it, at index {}, cont with  {:?}", index, &key[index+1..]);
+                            //println!("Found it, at index {}, cont with  {:?}", index, &key[index+1..]);
                             haystack_value.smart_search(&key[index+1..], hit);
                         }
                     });
@@ -428,7 +432,8 @@ mod trie {
 }
 
 
-fn parse_delta(prev: &str, now: &str, path: &Arc<PathBuf>, state: &mut State) {
+
+fn parse_delta(prev: &str, now: &str, path: &Arc<PathBuf>, tx: &mut mpsc::SyncSender<DiverEvent>) {
     let mut prev_lines = HashMap::<&str, usize>::new();
     for line in prev.lines() {
         *prev_lines.entry(line).or_default() += 1;
@@ -445,12 +450,15 @@ fn parse_delta(prev: &str, now: &str, path: &Arc<PathBuf>, state: &mut State) {
         fingerprint(line, &mut finger);
         if !finger.is_empty() {
             let tp = TracePoint {
-                fingerprint: finger,
                 file: path.clone(),
                 line_number,
             };
-            compile_error!("Make ratatui, activate/decative tracepoints. etc")
-            println!("Modified tracepoint: {:?}", tp);
+            let tp = TracePointData {
+                fingerprint: finger,
+                tp,
+                active: false,
+            };
+            tx.send(DiverEvent::SourceChanged(tp)).unwrap();
         }
     }
 }
@@ -484,8 +492,45 @@ fn fingerprint(line: &str, fingerprint: &mut String) -> Option<()> {
     None
 }
 
+impl State {
+    fn check_matching(
+        fingerprint_trie: &mut Trie<TracePoint>,
+        matching_lines: &mut Vec<String>,
+        line: &str) {
+        fingerprint_trie.smart_search_fn(line,|hit|{
+            matching_lines.push(line.to_string());
+        });
+    }
+}
 
-fn capturer(args: LogdiverArgs) {
+fn mainloop(
+    program_lines: mpsc::Receiver<DiverEvent>,
+    state: Arc<Mutex<State>>
+) {
+
+    while let Ok(event) = program_lines.recv() {
+        let mut state = state.lock().unwrap();
+        let mut state = &mut *state;
+        match event {
+            DiverEvent::SourceChanged(tp) => {
+                state.fingerprint_trie.push(&tp.fingerprint, tp.tp);
+                state.generation += 1;
+
+                state.matching_lines.clear();
+                for line in &state.all_lines {
+                    // Also, add a "recent fingerprints" section in ratatui
+                    State::check_matching(&mut state.fingerprint_trie, &mut state.matching_lines, line);
+                }
+            }
+            DiverEvent::ProgramOutput(line) => {
+                State::check_matching(&mut state.fingerprint_trie, &mut state.matching_lines, &line);
+                state.all_lines.push_back(line);
+            }
+        }
+    }
+}
+
+fn capturer(args: LogdiverArgs, program_lines: mpsc::SyncSender<DiverEvent>) {
     println!("Args values: {:?}", &args.values);
     let mut arg_iter = args.values.into_iter();
     let cmd = arg_iter.next().unwrap();
@@ -496,12 +541,14 @@ fn capturer(args: LogdiverArgs) {
         .spawn()
         .expect("failed to execute process"); //TODO, error handling
     use std::io::Read;
-    let mut all_lines = VecDeque::new();
+    //let mut all_lines = VecDeque::new();
     if let Some(child_out) = child.stdout {
         let child_out = BufReader::new(child_out);
+
         for line in child_out.lines() {
             let line = line.unwrap(); //TODO: Error handling
-            let value = gjson::parse(&line);
+
+            /*let value = gjson::parse(&line);
             value.each(|key, value| {
                 match key.str() {
                     "fields" => {
@@ -520,23 +567,37 @@ fn capturer(args: LogdiverArgs) {
                     _ => {}
                 };
                 true
-            });
+            });*/
             //println!("Read line {}", line);
-            all_lines.push_back(line);
+            program_lines.send(DiverEvent::ProgramOutput(line.clone())).unwrap();
         }
     }
 }
 
 #[derive(Debug)]
 struct TracePoint {
-    fingerprint: String,
     file: Arc<PathBuf>,
     line_number: usize,
+}
+
+pub enum DiverEvent {
+    SourceChanged(TracePointData),
+    ProgramOutput(String),
+}
+
+struct TracePointData {
+    fingerprint: String,
+    tp: TracePoint,
+    active: bool,
 }
 
 #[derive(Default)]
 struct State {
     fingerprint_trie: Trie<TracePoint>,
+    all_lines: VecDeque<String>,
+    matching_lines: Vec<String>,
+    tracepoints: Vec<TracePointData>,
+    generation: u64,
 }
 
 fn main() -> Result<()> {
@@ -547,6 +608,7 @@ fn main() -> Result<()> {
     // below will be monitored for changes.
     let pathbuf = PathBuf::from(&src);
 
+    let state = Arc::new(Mutex::new(State::default()));
 
     let mut tasks = VecDeque::new();
 
@@ -633,12 +695,10 @@ fn main() -> Result<()> {
 
 
 
+    compile_error!("Continue with some stats-printing, so we can troubleshoot")
 
 
     /*
-let terminal = ratatui::init();
-let result = run(terminal);
-ratatui::restore();
 result*/
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -648,63 +708,151 @@ result*/
     let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
     watcher.watch(&pathbuf, RecursiveMode::Recursive)?;
 
-    std::thread::spawn(||capturer(args));
+    let (diver_events_tx, diver_events_rx) = mpsc::sync_channel(16384);
+    let mut source_line_change_tx = diver_events_tx.clone();
 
-    let mut state = State::default();
 
-    let rs = OsString::from("rs");
-    for res in rx {
-        match res {
-            Ok(event) => {
-                match event.kind {
-                    EventKind::Any => {}
-                    EventKind::Access(_) => {}
-                    EventKind::Create(_) |
-                    EventKind::Modify(_)|
-                    EventKind::Remove(_) => {
+    std::thread::spawn(move||capturer(args, diver_events_tx));
 
-                        for path in event.paths {
-                            if path.extension() == Some(&rs) {
-                                let path = std::fs::canonicalize(path).unwrap(); //TODO: REmove unwrap
-                                if let Ok(contents) = std::fs::read_to_string(&path) {
-                                    match tot_results.entry(path) {
-                                        Entry::Occupied(mut prev_entry) => {
-                                            let prev_value = prev_entry.get();
 
-                                            parse_delta(prev_value, &contents, &mut state);
+    let state2 = state.clone();
+    std::thread::spawn(move||{
+        mainloop(diver_events_rx, state2);
+    });
 
-                                            *prev_entry.get_mut() = contents;
-                                        }
-                                        Entry::Vacant(v) => {
-                                            v.insert(contents);
+    std::thread::spawn(move||{
+
+        let rs = OsString::from("rs");
+        for res in rx {
+            match res {
+                Ok(event) => {
+                    match event.kind {
+                        EventKind::Any => {}
+                        EventKind::Access(_) => {}
+                        EventKind::Create(_) |
+                        EventKind::Modify(_) => {
+
+                            for path in event.paths {
+                                if path.extension() == Some(&rs) {
+                                    let path = std::fs::canonicalize(path).unwrap(); //TODO: REmove unwrap
+
+                                    if let Ok(contents) = std::fs::read_to_string(&path) {
+                                        match tot_results.entry(path.clone()) {
+                                            Entry::Occupied(mut prev_entry) => {
+                                                let path = Arc::new(path);
+                                                let prev_value = prev_entry.get();
+
+                                                parse_delta(prev_value, &contents, &path, &mut source_line_change_tx);
+
+                                                *prev_entry.get_mut() = contents;
+                                            }
+                                            Entry::Vacant(v) => {
+                                                v.insert(contents);
+                                            }
                                         }
                                     }
+                                    //tot_results
                                 }
-                                //tot_results
                             }
                         }
+                        EventKind::Other|EventKind::Remove(_) => {}
                     }
-                    EventKind::Other => {}
-                }
 
-            },
-            Err(error) => println!("Error: {error:?}"),
+                },
+                Err(error) => println!("Error: {error:?}"),
+            }
         }
-    }
+
+    });
+
+
+    let terminal = ratatui::init();
+
+    let result = run(terminal, state);
+    ratatui::restore();
 
 
     Ok(())
 }
 
-fn run(mut terminal: DefaultTerminal) -> Result<()> {
-    loop {
-        terminal.draw(render)?;
-        if matches!(event::read()?, Event::Key(_)) {
-            break Ok(());
+trait BlockExt: Sized {
+    fn highlight(self, our_index: usize, active_highlight: usize) -> Self;
+}
+
+impl<'a> BlockExt for Block<'a> {
+    fn highlight(self, our_index: usize, active_highlight: usize) -> Block<'a> {
+        if our_index == active_highlight {
+            self.border_style(Style::default().bg(Color::White).fg(Color::Black))
+        } else {
+            self
         }
     }
 }
+fn run(mut terminal: DefaultTerminal, state: Arc<Mutex<State>>) -> Result<()> {
+    let rows: [Row; 0] = [];
 
+    let fingerprint_table = Table::new(rows.clone(), [Percentage(50), Percentage(50)])
+        .block(Block::new().title("Fingerprints"))
+        .header(Row::new(vec!["Fingerprint", "File", "Line"]))
+        .row_highlight_style(Style::new().reversed());
+
+    let fingerprint_block = Block::new()
+        .borders(Borders::ALL)
+        .title("Fingerprints")
+        .highlight(0, 0);
+
+
+    let mut fingerprint_table_state = TableState::default();
+    let mut last_generation = u64::MAX;
+    loop {
+
+
+        {
+            let state = state.lock().unwrap();
+            if last_generation != state.generation {
+                terminal.draw( |frame|{
+                    let frame_area = frame.area();
+                    let mut rows = vec![];
+                    for tracepoint in state.tracepoints.iter() {
+                        rows.push(Row::new([tracepoint.fingerprint.to_string(), tracepoint.tp.file.as_path().display().to_string(), tracepoint.tp.line_number.to_string() ]));
+                    }
+
+                    frame.render_stateful_widget(fingerprint_table.clone().
+                        rows(rows.clone()).block(fingerprint_block.clone()), frame_area, &mut fingerprint_table_state);
+                })?;
+                last_generation = state.generation;
+
+            }
+        }
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    break Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+/*
 fn render(frame: &mut Frame) {
     frame.render_widget("logdiver", frame.area());
+}*/
+
+#[cfg(test)]
+mod tests {
+    use crate::trie::Trie;
+
+    #[test]
+    fn dotest() {
+        let mut trie = Trie::new();
+
+        trie.push("Binding to group ", 1);
+        trie.push("Joining multicast group  on if ", 2);
+
+        trie.smart_search_fn("Matching key: 66 against [114, 117, 110, 110, 105, 110, 103, 32, 49, 32, 116, 101, 115, 116]", |hit|{
+            println!("{:?}", hit);
+        });
+
+    }
 }
