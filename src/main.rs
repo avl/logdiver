@@ -1,27 +1,33 @@
 extern crate core;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
+use std::panic::catch_unwind;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread::available_parallelism;
-use std::time::Duration;
-use anyhow::Result;
-use crossterm::event::{self, Event};
+use std::time::{Duration, Instant};
+use anyhow::{anyhow, Context, Result};
+use ratatui::crossterm::event::{self, Event, KeyCode};
 use indexmap::IndexMap;
 use indexmap::map::Entry;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{DefaultTerminal, Frame};
-
+use tui_textarea::TextArea;
 use clap::{Parser, Subcommand};
 use clap::parser::Values;
-use ratatui::layout::Constraint::Percentage;
-use ratatui::prelude::{Color, Style, Stylize};
-use ratatui::widgets::{Block, Borders, Row, Table, TableState};
+use ratatui::crossterm::event::{KeyEvent, KeyEventKind};
+use ratatui::layout::{Flex, Margin, Size};
+use ratatui::palette::{Hsl, RgbHue};
+use ratatui::prelude::{Color, Constraint, Direction, Layout, Line, Rect, Style, Stylize};
+use ratatui::style::Styled;
+use ratatui::text::Span;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState};
+use savefile::prelude::Savefile;
 use crate::trie::Trie;
 
 #[derive(Debug, Parser)]
@@ -31,14 +37,19 @@ struct LogdiverArgs {
     #[arg(short = 's', long)]
     source: Option<String>,
 
-    values: Vec<String>
+    #[arg(long)]
+    debug_notify: Option<bool>,
+
+    #[arg(required = true)]
+    values: Vec<String>,
+
 }
 
 mod trie {
     use std::fmt::{Debug, Formatter};
     use std::sync::Mutex;
     use memchr::memchr;
-
+    use crate::MatchSequence;
 
     enum TinyMap<V> {
         Inline(u8,[u8;8],[Option<V>;8]), //TODO: Use MaybeUninit
@@ -68,19 +79,25 @@ mod trie {
                 TinyMap::Heap(keys, _) => {keys.is_empty()}
             }
         }
-        fn visit<'a>(&'a self, mut visitor: impl FnMut(u8, &'a V)) {
+        /// Return false from visitor to stop
+        fn visit<'a>(&'a self, mut visitor: impl FnMut(u8, &'a V) -> bool) -> bool {
             match self {
                 TinyMap::Inline(count, keys, values) => {
                     for i in 0..*count {
-                        visitor(keys[i as usize], values[i as usize].as_ref().unwrap());
+                        if !visitor(keys[i as usize], values[i as usize].as_ref().unwrap()) {
+                            return false;
+                        }
                     }
                 }
                 TinyMap::Heap(keys, values) => {
                     for (key,val) in keys.iter().zip(values.iter()) {
-                        visitor(*key,val);
+                        if !visitor(*key,val) {
+                            return false;
+                        }
                     }
                 }
             }
+            true
         }
         fn remove(&mut self, key: u8) {
             match self {
@@ -215,35 +232,51 @@ mod trie {
                 }
             }
         }
-        pub fn smart_search<'a>(&'a self, mut key: &[u8], hit: &mut impl FnMut(&'a V)) {
+        pub fn smart_search<'a>(&'a self, mut key: &[u8], match_sequence: &mut MatchSequence, hit: &mut impl FnMut(&'a V, &MatchSequence) -> bool ) -> bool {
             match self {
                 TrieNode::Head { map, value } => {
                     if let Some(v) = value.as_ref() {
-                        hit(v);
+                        if !hit(v, &match_sequence) {
+                            return false;
+                        }
                     }
                     if key.is_empty() {
-                        return;
+                        return true;
                     }
+
 
                     map.visit(|haystack_key, haystack_value|{
                         //println!("Matching key: {:?} against {:?}", haystack_key, key);
                         if let Some(index) = memchr(haystack_key, &key[0..]) {
                             //println!("Found it, at index {}, cont with  {:?}", index, &key[index+1..]);
-                            haystack_value.smart_search(&key[index+1..], hit);
+                            let restore = match_sequence.save();
+                            match_sequence.add(index as u32);
+                            let r = haystack_value.smart_search(&key[index+1..], match_sequence, hit);
+                            match_sequence.restore(restore);
+                            if !r {
+                                return false;
+                            } else {
+                                return true;
+                            }
                         }
-                    });
+                        true
+                    })
                 }
                 TrieNode::Tail { tail, value:Some(value) } => {
+                    let saved = match_sequence.save();
                     for needle in tail {
                         if let Some(index) = memchr(*needle, &key[0..]) {
+                            match_sequence.add(index as u32);
                             key = &key[index+1..];
                         } else {
-                            return;
+                            return true;
                         }
                     }
-                    hit(value)
+                    let t = hit(value, match_sequence);
+                    match_sequence.restore(saved);
+                    t
                 }
-                _ => {}
+                _ => {true}
             }
         }
 
@@ -356,12 +389,16 @@ mod trie {
             self.top.get(key.as_bytes())
         }
         /// 'grdmn' matches 'grodman', 'atn' matches 'attention' etc.
-        pub fn smart_search_fn(&self, key: &str, mut hit: impl FnMut(&V)) {
-            self.top.smart_search(key.as_bytes(), &mut hit)
+        /// Return false to stop search
+        pub fn smart_search_fn(&self, key: &str, mut hit: impl FnMut(&V, &MatchSequence) -> bool) {
+            self.top.smart_search(key.as_bytes(), &mut MatchSequence::default(), &mut hit);
         }
         pub fn smart_search(&self, key: &str) -> Vec<&V> {
             let mut t = Vec::new();
-            self.top.smart_search(key.as_bytes(), &mut |v|t.push(v));
+            self.top.smart_search(key.as_bytes(), &mut MatchSequence::default(), &mut |v,m|{
+                t.push(v);
+                true
+            });
             t
         }
         pub fn push(&mut self, key: &str, value: V) {
@@ -433,7 +470,7 @@ mod trie {
 
 
 
-fn parse_delta(prev: &str, now: &str, path: &Arc<PathBuf>, tx: &mut mpsc::SyncSender<DiverEvent>) {
+fn parse_delta(prev: &str, now: &str, path: &Arc<PathBuf>, tx: &mut mpsc::SyncSender<DiverEvent>, debug_notify: bool) {
     let mut prev_lines = HashMap::<&str, usize>::new();
     for line in prev.lines() {
         *prev_lines.entry(line).or_default() += 1;
@@ -447,15 +484,21 @@ fn parse_delta(prev: &str, now: &str, path: &Arc<PathBuf>, tx: &mut mpsc::SyncSe
             }
         }
         let mut finger = String::new();
-        fingerprint(line, &mut finger);
+        let mut brackets = false;
+        fingerprint(line, &mut finger, &mut brackets);
         if !finger.is_empty() {
             let tp = TracePoint {
                 file: path.clone(),
                 line_number,
+                tracepoint: u32::MAX,
             };
+            if debug_notify {
+                println!("New tracepoint: {}", finger);
+            }
             let tp = TracePointData {
                 fingerprint: finger,
                 tp,
+                smart: brackets,
                 active: false,
             };
             tx.send(DiverEvent::SourceChanged(tp)).unwrap();
@@ -463,7 +506,7 @@ fn parse_delta(prev: &str, now: &str, path: &Arc<PathBuf>, tx: &mut mpsc::SyncSe
     }
 }
 
-fn fingerprint(line: &str, fingerprint: &mut String) -> Option<()> {
+fn fingerprint(line: &str, fingerprint: &mut String, brackets: &mut bool) -> Option<()> {
     let mut tokens = line.chars().peekable();
     loop {
         let tok = tokens.next()?;
@@ -478,6 +521,7 @@ fn fingerprint(line: &str, fingerprint: &mut String) -> Option<()> {
                 if tok == '"' {
                     break;
                 } else if tok == '{' {
+                    *brackets = true;
                     depth += 1;
                 } else if tok == '}' {
                     depth -= 1;
@@ -492,15 +536,112 @@ fn fingerprint(line: &str, fingerprint: &mut String) -> Option<()> {
     None
 }
 
+#[derive(Savefile, Default, Clone)]
+struct MatchSequence {
+    range: Vec<(u32,u32)>
+}
+
+impl MatchSequence {
+    pub(crate) fn visit(&self, len: usize, mut visitor: impl FnMut(usize, usize, bool)) {
+        let mut expected_start = 0;
+        for (start,end) in &self.range {
+            if *start as usize != expected_start {
+                visitor(expected_start, *start as usize, false);
+            }
+            visitor(*start as usize, *end as usize, true);
+            expected_start = *end as usize;
+        }
+        if expected_start != len {
+            visitor(expected_start, len, false);
+        }
+    }
+}
+
+struct Restore {
+    range_count: u32,
+    end_at: u32,
+}
+impl MatchSequence {
+    pub fn add(&mut self, index: u32) {
+        if let Some(last) = self.range.last_mut() && index == 0 {
+            last.1 += 1;
+            return;
+        }
+        if let Some(last) = self.range.last().map(|x|x.1) {
+            self.range.push((last + index, last  + index+1));
+        } else {
+            self.range.push((index, index+1));
+        }
+    }
+    pub fn save(&mut self) -> Restore {
+        Restore {
+            range_count: self.range.len() as u32,
+            end_at: self.range.last().map(|x|x.1).unwrap_or(0)
+        }
+    }
+    pub fn restore(&mut self, restore: Restore)  {
+        self.range.truncate(restore.range_count as usize);
+        if let Some(last) = self.range.last_mut() {
+            last.1 = restore.end_at;
+        }
+    }
+}
+
 impl State {
     fn check_matching(
         fingerprint_trie: &mut Trie<TracePoint>,
-        matching_lines: &mut Vec<String>,
-        line: &str) {
-        fingerprint_trie.smart_search_fn(line,|hit|{
-            matching_lines.push(line.to_string());
+        matching_lines: &mut Vec<MatchingLine>,
+        line: &LogLine) {
+        fingerprint_trie.smart_search_fn(&line.message,|hit, m| -> bool {
+
+            let m = MatchingLine {
+                log_line: line.clone(),
+                hits: m.clone(),
+                tp: hit.tracepoint,
+            };
+            matching_lines.push(m);
+            false
         });
     }
+    fn add_tracepoint_trie(trie: &mut Trie<TracePoint>, tp: &TracePointData) {
+        trie.push(&tp.fingerprint, tp.tp.clone());
+    }
+    fn rebuild_trie(&mut self) {
+        self.fingerprint_trie = Trie::new();
+        for tp in &self.tracepoints {
+            Self::add_tracepoint_trie(&mut self.fingerprint_trie, tp);
+        }
+
+        self.rebuild_matches()
+    }
+    fn rebuild_matches(&mut self) {
+        self.generation += 1;
+
+        self.matching_lines.clear();
+        for line in &self.all_lines {
+            // Also, add a "recent fingerprints" section in ratatui
+            State::check_matching(&mut self.fingerprint_trie, &mut self.matching_lines, line);
+        }
+    }
+}
+
+impl State {
+    fn add_tracepoint(&mut self,
+                      mut tp: TracePointData) {
+        let mut indices:Vec<_>  = self.tracepoints.iter().map(|x|x.tp.tracepoint).collect();
+        indices.sort();
+        let tp_index = if let Some(hole) = indices.windows(2).find(|xs|xs[1] != xs[0]+1) {
+            hole[0]+1
+        } else {
+             indices.len() as u32
+        };
+
+        tp.tp.tracepoint = tp_index;
+        Self::add_tracepoint_trie(&mut self.fingerprint_trie, &tp);
+        self.tracepoints.push(tp);
+        self.rebuild_matches();
+    }
+
 }
 
 fn mainloop(
@@ -513,33 +654,18 @@ fn mainloop(
         let mut state = &mut *state;
         match event {
             DiverEvent::SourceChanged(tp) => {
-                state.fingerprint_trie.push(&tp.fingerprint, tp.tp);
-                state.generation += 1;
-
-                state.matching_lines.clear();
-                for line in &state.all_lines {
-                    // Also, add a "recent fingerprints" section in ratatui
-                    State::check_matching(&mut state.fingerprint_trie, &mut state.matching_lines, line);
-                }
+                state.add_tracepoint(tp);
             }
             DiverEvent::ProgramOutput(line) => {
                 State::check_matching(&mut state.fingerprint_trie, &mut state.matching_lines, &line);
                 state.all_lines.push_back(line);
+                state.generation += 1;
             }
         }
     }
 }
 
-fn capturer(args: LogdiverArgs, program_lines: mpsc::SyncSender<DiverEvent>) {
-    println!("Args values: {:?}", &args.values);
-    let mut arg_iter = args.values.into_iter();
-    let cmd = arg_iter.next().unwrap();
-    let rest: Vec<_> = arg_iter.collect();
-    let mut child = Command::new(cmd)
-        .args(&rest)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("failed to execute process"); //TODO, error handling
+fn capturer(child: Child, program_lines: mpsc::SyncSender<DiverEvent>) {
     use std::io::Read;
     //let mut all_lines = VecDeque::new();
     if let Some(child_out) = child.stdout {
@@ -548,59 +674,169 @@ fn capturer(args: LogdiverArgs, program_lines: mpsc::SyncSender<DiverEvent>) {
         for line in child_out.lines() {
             let line = line.unwrap(); //TODO: Error handling
 
-            /*let value = gjson::parse(&line);
+            let value = gjson::parse(&line);
+            let mut message = String::new();
+            let mut target = String::new();
+            let mut level = String::new();
+            let mut timestamp = String::new();
+            let mut fields = String::new();
             value.each(|key, value| {
                 match key.str() {
                     "fields" => {
-                        let value = value.get("message");
-                        println!("message: {}", value);
+                        value.each(|key,value|{
+                            if key.str() == "message" {
+                                message = value.to_string();
+                            } else {
+                                use std::fmt::Write;
+                                write!(&mut fields, "{} = {}, ", key.str(), value.str()).unwrap();
+                            }
+                            true
+                        });
+                        //let value = value.get("message");
+                        //println!("message: {}", value);
                     }
                     "target" => {
-                        println!("target: {}", value);
+                        target = value.to_string();
+                        //println!("target: {}", value);
                     }
                     "level" => {
-                        println!("Level: {}", value);
+                        level = value.to_string();
+                        //println!("Level: {}", value);
                     }
                     "timestamp" => {
-                        println!("Time: {}", value);
+                        timestamp = value.to_string();
+                        //println!("Time: {}", value);
                     }
                     _ => {}
                 };
                 true
-            });*/
+            });
             //println!("Read line {}", line);
-            program_lines.send(DiverEvent::ProgramOutput(line.clone())).unwrap();
+            program_lines.send(DiverEvent::ProgramOutput(LogLine {
+                time: timestamp,
+                target,
+                level,
+                message,
+                fields
+            })).unwrap();
+
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Savefile,Debug, Clone)]
 struct TracePoint {
     file: Arc<PathBuf>,
     line_number: usize,
+    tracepoint: u32,
 }
 
 pub enum DiverEvent {
     SourceChanged(TracePointData),
-    ProgramOutput(String),
+    ProgramOutput(LogLine),
 }
 
+#[derive(Savefile, Clone)]
 struct TracePointData {
     fingerprint: String,
     tp: TracePoint,
+    smart: bool,
     active: bool,
 }
 
-#[derive(Default)]
-struct State {
-    fingerprint_trie: Trie<TracePoint>,
-    all_lines: VecDeque<String>,
-    matching_lines: Vec<String>,
-    tracepoints: Vec<TracePointData>,
-    generation: u64,
+#[derive(Clone)]
+struct LogLine {
+    time: String,
+    target: String,
+    level: String,
+    message: String,
+    fields: String,
 }
 
+#[derive(Eq, PartialEq,Clone,Copy, Default, Savefile)]
+enum Window {
+    #[default]
+    Filter,
+    Output
+}
+impl Window  {
+    fn next(&self) -> Window {
+        match self {
+            Window::Filter => {Self::Output}
+            Window::Output => {Self::Filter}
+        }
+    }
+}
+
+struct MatchingLine {
+    log_line: LogLine,
+    hits: MatchSequence,
+    tp: u32,
+}
+
+#[derive(Default, Savefile)]
+struct State {
+    #[savefile_ignore]
+    #[savefile_introspect_ignore]
+    fingerprint_trie: Trie<TracePoint>,
+    #[savefile_ignore]
+    #[savefile_introspect_ignore]
+    all_lines: VecDeque<LogLine>,
+    #[savefile_ignore]
+    #[savefile_introspect_ignore]
+    matching_lines: Vec<MatchingLine>,
+    tracepoints: Vec<TracePointData>,
+    #[savefile_ignore]
+    #[savefile_introspect_ignore]
+    generation: u64,
+    active_window: Window,
+    selected_filter: Option<usize>,
+    selected_output: Option<usize>,
+}
 fn main() -> Result<()> {
+    let res = match catch_unwind(run_main) {
+        Ok(err) => {
+            err
+        }
+        Err(err) => {
+            if let Some(err) = err.downcast_ref::<String>() {
+                Err(anyhow!("Panic: {err}"))
+            }
+            else if let Some(err) = err.downcast_ref::<&'static str>() {
+                Err(anyhow!("Panic: {err}"))
+            } else {
+                Err(anyhow!("panic!"))
+            }
+        }
+    };
+    ratatui::restore();
+    res
+}
+
+#[derive(Eq, PartialEq, Clone)]
+struct Debounced {
+    at: Instant,
+    path: PathBuf,
+    size: u64,
+    debouncing_iterations: u64,
+}
+
+impl PartialOrd for Debounced {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Debounced {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (other.at, &other.path).cmp(&(self.at,&self.path))
+    }
+}
+
+const LOGDIVER_FILE: &str = ".logdiver.bin";
+
+
+
+fn run_main() -> Result<()> {
 
     let args = LogdiverArgs::parse();
     let src = args.source.clone().unwrap_or(".".into());
@@ -608,7 +844,14 @@ fn main() -> Result<()> {
     // below will be monitored for changes.
     let pathbuf = PathBuf::from(&src);
 
-    let state = Arc::new(Mutex::new(State::default()));
+    let state = Arc::new(Mutex::new(
+        savefile::load_file(LOGDIVER_FILE, 0)
+            .map(|mut state: State|{
+                state.rebuild_trie();
+                state
+            })
+            .unwrap_or(State::default())
+    ));
 
     let mut tasks = VecDeque::new();
 
@@ -695,8 +938,6 @@ fn main() -> Result<()> {
 
 
 
-    compile_error!("Continue with some stats-printing, so we can troubleshoot")
-
 
     /*
 result*/
@@ -711,76 +952,144 @@ result*/
     let (diver_events_tx, diver_events_rx) = mpsc::sync_channel(16384);
     let mut source_line_change_tx = diver_events_tx.clone();
 
+    let mut debouncing = BinaryHeap::<Debounced>::new();
 
-    std::thread::spawn(move||capturer(args, diver_events_tx));
+    let debug_notify = args.debug_notify.unwrap_or(false);
+    std::thread::spawn(move||{
 
+        let rs = OsString::from("rs");
+        if debug_notify {
+            println!("Starting watch");
+        }
+        loop {
+            let mut next_debounce_at = Duration::from_secs(60);
+            if let Some(top) = debouncing.peek() {
+                next_debounce_at = top.at.saturating_duration_since(Instant::now());
+            }
+
+            let res = rx.recv_timeout(next_debounce_at);
+
+            if let Ok( res) = res {
+                match res {
+                    Ok(event) => {
+
+                        match event.kind {
+                            EventKind::Any => {}
+                            EventKind::Access(_) => {}
+                            EventKind::Create(_) |
+                            EventKind::Modify(_) => {
+
+                                for path in event.paths {
+                                    if path.extension() == Some(&rs) {
+                                        let path = std::fs::canonicalize(path).unwrap(); //TODO: REmove unwrap
+                                        if let Ok(meta) = std::fs::metadata(&path) {
+                                            if !meta.is_file() {
+                                                continue;
+                                            }
+                                            //println!("Scheduling {}", path.as_path().display());
+                                            debouncing.push(Debounced {
+                                                at: Instant::now() + Duration::from_millis(500),
+                                                path,
+                                                size: meta.len(),
+                                                debouncing_iterations: 0,
+                                            });
+                                        }
+
+
+                                        //tot_results
+                                    }
+                                }
+                            }
+                            EventKind::Other|EventKind::Remove(_) => {}
+                        }
+
+                    },
+                    Err(error) => println!("Error: {error:?}"),
+                }
+            } else {
+                if let Some(mut debounced) = debouncing.pop() {
+                    //println!("Bounce-checking {}", debounced.path.as_path().display());
+
+                    if let Ok(meta) = std::fs::metadata(&debounced.path) {
+                        if meta.len() != debounced.size {
+                            //println!("Size mismatch {} != {}", meta.len(), debounced.size);
+                            
+                            debounced.at = Instant::now() + Duration::from_millis((100*(1<<debounced.debouncing_iterations)).min(2000));
+                            debounced.size = meta.len();
+                            debounced.debouncing_iterations += 1;
+                            debouncing.push(debounced);
+                        } else {
+                            if let Ok(contents) = std::fs::read_to_string(&debounced.path) {
+                                match tot_results.entry(debounced.path.clone()) {
+                                    Entry::Occupied(mut prev_entry) => {
+                                        let prev_value = prev_entry.get();
+                                        if contents.len() < prev_value.len().saturating_sub(40) && debounced.debouncing_iterations < 3 {
+                                            debounced.at = Instant::now() + Duration::from_millis(2000);
+                                            debounced.size = meta.len();
+                                            debounced.debouncing_iterations = 3;
+                                            debouncing.push(debounced);
+                                            continue;
+                                        }
+                                        let path = Arc::new(debounced.path);
+                                        if debug_notify {
+                                            println!("Read {} byte {}", contents.len(), path.as_path().display());
+                                        }
+
+                                        parse_delta(prev_value, &contents, &path, &mut source_line_change_tx, debug_notify);
+
+                                        *prev_entry.get_mut() = contents;
+                                    }
+                                    Entry::Vacant(v) => {
+                                        v.insert(contents);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    if debug_notify {
+        std::thread::sleep(std::time::Duration::from_secs(86400));
+        return Ok(());
+    }
+
+    //println!("Args values: {:?}", &args.values);
+    let mut arg_iter = args.values.into_iter();
+    let cmd = arg_iter.next().unwrap();
+    let rest: Vec<_> = arg_iter.collect();
+    let mut child = Command::new(&cmd)
+        .args(&rest)
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(||format!("failed to spawn child process: '{}' with args: {}",
+                                &cmd, rest.join(" "))
+        )?;
+
+
+    std::thread::spawn(move||capturer(child, diver_events_tx));
 
     let state2 = state.clone();
     std::thread::spawn(move||{
         mainloop(diver_events_rx, state2);
     });
 
-    std::thread::spawn(move||{
-
-        let rs = OsString::from("rs");
-        for res in rx {
-            match res {
-                Ok(event) => {
-                    match event.kind {
-                        EventKind::Any => {}
-                        EventKind::Access(_) => {}
-                        EventKind::Create(_) |
-                        EventKind::Modify(_) => {
-
-                            for path in event.paths {
-                                if path.extension() == Some(&rs) {
-                                    let path = std::fs::canonicalize(path).unwrap(); //TODO: REmove unwrap
-
-                                    if let Ok(contents) = std::fs::read_to_string(&path) {
-                                        match tot_results.entry(path.clone()) {
-                                            Entry::Occupied(mut prev_entry) => {
-                                                let path = Arc::new(path);
-                                                let prev_value = prev_entry.get();
-
-                                                parse_delta(prev_value, &contents, &path, &mut source_line_change_tx);
-
-                                                *prev_entry.get_mut() = contents;
-                                            }
-                                            Entry::Vacant(v) => {
-                                                v.insert(contents);
-                                            }
-                                        }
-                                    }
-                                    //tot_results
-                                }
-                            }
-                        }
-                        EventKind::Other|EventKind::Remove(_) => {}
-                    }
-
-                },
-                Err(error) => println!("Error: {error:?}"),
-            }
-        }
-
-    });
 
 
     let terminal = ratatui::init();
 
-    let result = run(terminal, state);
-    ratatui::restore();
-
+    run(terminal,state)?;
 
     Ok(())
 }
 
 trait BlockExt: Sized {
-    fn highlight(self, our_index: usize, active_highlight: usize) -> Self;
+    fn highlight<T:Eq>(self, our_index: T, active_highlight: T) -> Self;
 }
 
 impl<'a> BlockExt for Block<'a> {
-    fn highlight(self, our_index: usize, active_highlight: usize) -> Block<'a> {
+    fn highlight<T:Eq>(self, our_index: T, active_highlight: T) -> Block<'a> {
         if our_index == active_highlight {
             self.border_style(Style::default().bg(Color::White).fg(Color::Black))
         } else {
@@ -788,56 +1097,251 @@ impl<'a> BlockExt for Block<'a> {
         }
     }
 }
+fn popup_area(area: Rect, percent_x: u16) -> Rect {
+    let vertical = Layout::vertical([Constraint::Length(3)]).flex(Flex::Center);
+    let horizontal = Layout::horizontal([Constraint::Percentage(percent_x)]).flex(Flex::Center);
+    let [area] = vertical.areas(area);
+    let [area] = horizontal.areas(area);
+    area
+}
+
+fn color_by_index(index: u32) -> Color {
+    let colour = (index.wrapping_mul(57)) as f32;
+    Color::from_hsl(Hsl::new(RgbHue::from_degrees(colour),1.0,0.5))
+}
+
+
 fn run(mut terminal: DefaultTerminal, state: Arc<Mutex<State>>) -> Result<()> {
     let rows: [Row; 0] = [];
 
-    let fingerprint_table = Table::new(rows.clone(), [Percentage(50), Percentage(50)])
-        .block(Block::new().title("Fingerprints"))
-        .header(Row::new(vec!["Fingerprint", "File", "Line"]))
-        .row_highlight_style(Style::new().reversed());
-
-    let fingerprint_block = Block::new()
-        .borders(Borders::ALL)
-        .title("Fingerprints")
-        .highlight(0, 0);
+    enum GuiState {
+        Normal,
+        AddNewFilter(TextArea<'static>)
+    }
 
 
-    let mut fingerprint_table_state = TableState::default();
+
+    let mut filter_table_state = TableState::default();
+    let mut output_table_state = TableState::default();
     let mut last_generation = u64::MAX;
+    let mut render_cnt = 0;
+    let mut lastsize = Size::default();
+    let mut gui_state = GuiState::Normal;
+
+    {
+        let state = state.lock().unwrap();
+        filter_table_state.select(state.selected_filter);
+        output_table_state.select(state.selected_output);
+    }
+
     loop {
+
 
 
         {
             let state = state.lock().unwrap();
-            if last_generation != state.generation {
+            let filter_table = Table::new(rows.clone(), [Constraint::Percentage(50), Constraint::Percentage(50), Constraint::Length(5)])
+                .block(Block::bordered()
+                    .title("Filters")
+                    .title_bottom("A - Add filter")
+                    .highlight(Window::Filter, state.active_window))
+                .header(Row::new(vec!["Fingerprint", "File", "Line", "Active"]))
+                .row_highlight_style(Style::new().bg(Color::Rgb(60,60,60)))
+                .highlight_symbol(">");
+
+            let output_table = Table::new(rows.clone(), [Constraint::Length(15), Constraint::Length(10), Constraint::Fill(10), Constraint::Fill(30)])
+                .block(Block::bordered().title("Output").highlight(Window::Output, state.active_window))
+                .header(Row::new(vec!["Time", "Level", "Target", "Message"]))
+                .row_highlight_style(Style::new().bg(Color::Rgb(60,60,60)))
+                .highlight_symbol(">");
+
+
+
+            let newsize = terminal.size()?;
+            if last_generation != state.generation || lastsize != newsize {
+                lastsize = newsize;
                 terminal.draw( |frame|{
-                    let frame_area = frame.area();
-                    let mut rows = vec![];
-                    for tracepoint in state.tracepoints.iter() {
-                        rows.push(Row::new([tracepoint.fingerprint.to_string(), tracepoint.tp.file.as_path().display().to_string(), tracepoint.tp.line_number.to_string() ]));
+
+                    let main_vertical = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints(vec![
+                            Constraint::Fill(10),
+                            Constraint::Length(14),
+                        ])
+                        .split(frame.area());
+
+                    let lower_split = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints(vec![
+                            Constraint::Length(20),
+                            Constraint::Fill(10)
+                        ]).split(main_vertical[1]);
+                    let output_area: Rect = main_vertical[0];
+                    let stats_area: Rect = lower_split[0];
+                    let filter_area = lower_split[1];
+
+
+                    let stats = [("Total", state.all_lines.len().to_string()), ("Shown", state.matching_lines.len().to_string()),
+                        ("render", render_cnt.to_string())
+                    ];
+                    render_cnt += 1;
+                    frame.render_widget(Block::bordered().title("stats"), stats_area);
+                    let mut cur_stat_area = Rect::new(stats_area.x+1, stats_area.y+1, stats_area.width-2, 1);
+                    for (key,val ) in stats {
+                        let mut key_area = cur_stat_area;
+                        key_area.width = 10;
+                        let mut value_area = cur_stat_area;
+                        value_area.x = 12;
+                        value_area.width -= 12;
+                        frame.render_widget(Paragraph::new(format!("{}:", key)), key_area);
+                        frame.render_widget(Paragraph::new(val), value_area);
+                        cur_stat_area.y += 1;
                     }
 
-                    frame.render_stateful_widget(fingerprint_table.clone().
-                        rows(rows.clone()).block(fingerprint_block.clone()), frame_area, &mut fingerprint_table_state);
+                    //let mut cur_output_area = Rect::new(output_area.x+1, output_area.y+1, output_area.width-2, 1);
+                    //frame.render_widget(Block::bordered().title("Output"), output_area);
+                    let mut rows = vec![];
+                    for mline in &state.matching_lines {
+                        let line = &mline.log_line;
+
+                        let mut message_line = Line::default();
+                        mline.hits.visit(mline.log_line.message.len(), |start,end,hit|{
+                            message_line.push_span(Span::styled(
+                                &line.message[start..end], if hit {
+                                    Style::default().fg(color_by_index(mline.tp))
+                                } else {
+                                    Style::default()
+                                }
+                            ))
+                        });
+
+                        rows.push(Row::new([
+                            Line::raw(&line.time),Line::raw(&line.level),Line::raw(&line.target), message_line
+                        ]));
+                        //frame.render_widget(Paragraph::new(line.to_string()), cur_output_area);
+                        //cur_output_area.y += 1;
+                        //if cur_output_area.y >= output_area.y + output_area.height-1 {
+                         //   break;
+                        //}
+                    }
+                    frame.render_stateful_widget(output_table.clone().
+                        rows(rows.clone()), output_area, &mut output_table_state);
+
+                    let mut rows = vec![];
+                    for tracepoint in state.tracepoints.iter() {
+                        rows.push(Row::new([
+                            Line::raw(tracepoint.fingerprint.to_string()).set_style(Style::default().fg(color_by_index(tracepoint.tp.tracepoint))),
+                            Line::raw(tracepoint.tp.file.as_path().display().to_string()),
+                            Line::raw(tracepoint.tp.line_number.to_string()),
+                            Line::raw(if tracepoint.active {"X".to_string()} else {"".to_string()}),
+                        ]));
+                    }
+
+                    frame.render_stateful_widget(filter_table.clone().
+                        rows(rows.clone()), filter_area, &mut filter_table_state);
+
+                    match &mut gui_state {
+                        GuiState::Normal => {}
+                        GuiState::AddNewFilter(text) => {
+                            let area = popup_area(frame.area(), 75);
+                            frame.render_widget(Clear, area); //this clears out the background
+                            frame.render_widget(&*text, area);
+                        }
+                    }
+
                 })?;
                 last_generation = state.generation;
 
             }
         }
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    break Ok(());
+            let event = event::read()?;
+            let mut state = state.lock().unwrap();
+            last_generation = u64::MAX;
+            match &event {
+                Event::Key(KeyEvent{kind: KeyEventKind::Press,code, ..}) => {
+                    match &mut gui_state {
+                        GuiState::Normal => {
+                            match code {
+                                KeyCode::Esc | KeyCode::Char('Q')| KeyCode::Char('q')=> {
+                                    break Ok(());
+                                }
+                                KeyCode::Delete if state.active_window == Window::Filter => {
+                                    if let Some(index) = filter_table_state.selected() {
+                                        state.tracepoints.remove(index);
+                                        state.rebuild_trie();
+                                        _ = savefile::save_file(LOGDIVER_FILE, 0, &*state);
+                                    }
+                                }
+                                KeyCode::Tab => {
+                                    state.active_window = state.active_window.next();
+                                }
+                                KeyCode::Char('A') | KeyCode::Char('a') => {
+                                    let mut text = TextArea::default();
+                                    text.set_block(Block::new().borders(Borders::ALL).title("Filter"));
+                                    gui_state = GuiState::AddNewFilter(text);
+                                }
+                                KeyCode::Up => {
+                                    match state.active_window {
+                                        Window::Filter => {
+                                            filter_table_state.select_previous();
+                                            state.selected_filter = filter_table_state.selected();
+                                        }
+                                        Window::Output => {
+                                            output_table_state.select_previous();
+                                            state.selected_output = output_table_state.selected();
+                                        }
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    match state.active_window {
+                                        Window::Filter => {
+                                            filter_table_state.select_next();
+                                            state.selected_filter = filter_table_state.selected();
+                                        }
+                                        Window::Output => {
+                                            output_table_state.select_next();
+                                            state.selected_output = output_table_state.selected();
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        GuiState::AddNewFilter(text) => {
+                            match code {
+                                KeyCode::Esc => {
+                                    gui_state = GuiState::Normal;
+                                }
+                                KeyCode::Enter => {
+                                    let fingerprint = text.lines()[0].to_string();
+                                    state.add_tracepoint(TracePointData {
+                                        fingerprint,
+                                        tp: TracePoint {
+                                            file: Arc::new(Default::default()),
+                                            line_number: 0,
+                                            tracepoint: u32::MAX,
+                                        },
+                                        smart: false,
+                                        active: true,
+                                    });
+                                    gui_state = GuiState::Normal;
+                                    _ = savefile::save_file(LOGDIVER_FILE, 0, &*state);
+                                }
+                                _ => {
+                                    text.input(event);
+                                }
+                            }
+
+                        }
+                    }
                 }
                 _ => {}
             }
         }
     }
 }
-/*
-fn render(frame: &mut Frame) {
-    frame.render_widget("logdiver", frame.area());
-}*/
+
 
 #[cfg(test)]
 mod tests {
