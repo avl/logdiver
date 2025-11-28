@@ -1,0 +1,14 @@
+---
+source: src/line_parser.rs
+expression: line
+snapshot_kind: text
+---
+Line {
+    time: "2025-11-15T21:03:16.997950Z",
+    level: "TRACE",
+    thread: "tokio-runtime-worker",
+    meta: "request{method=GET uri=/brb/whoami version=HTTP/1.1}: ",
+    namespace: "tower_http::trace::on_response:",
+    path: "/Users/anders.musikka/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tower-http-0.6.6/src/trace/on_response.rs:114:",
+    message: "finished processing request latency=1062 μs status=412",
+}
