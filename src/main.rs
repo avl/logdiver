@@ -403,18 +403,8 @@ impl State {
 
     fn save(&self) {
         let mut f = BufWriter::new(File::create(LOGDIVER_FILE).unwrap());
-        std::fs::write("telltale.txt", format!("{:?}", self.tracepoints)).unwrap();
         Serializer::save(&mut f, 0, self, false).unwrap();
         f.flush().unwrap();
-        std::fs::write(
-            "telltale2.txt",
-            format!(
-                "meta: {:?} , tracepoints: {:?}",
-                std::fs::metadata(LOGDIVER_FILE).unwrap(),
-                self.tracepoints
-            ),
-        )
-        .unwrap();
     }
 }
 
@@ -877,17 +867,6 @@ impl Buffer {
         let mut inner = self.inner.lock().unwrap();
         inner.buffer.push_back(BufferElement { data, seen_by: 0 });
         let count = Arc::weak_count(&inner.clients);
-        std::fs::write(
-            "tell.txt",
-            format!(
-                "start_index = {}, refcount = {}, totcount = {}, front seen = {:?}",
-                inner.start_index,
-                count,
-                inner.buffer.len(),
-                inner.buffer.front().map(|x| x.seen_by).unwrap_or(0)
-            ),
-        )
-        .unwrap();
         while let Some(front) = inner.buffer.front() {
             if front.seen_by >= count {
                 inner.start_index += 1;
