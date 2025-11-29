@@ -36,6 +36,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use std::borrow::Cow;
+use memchr::memchr;
+use ratatui::crossterm::event::KeyModifiers;
 use tui_textarea::TextArea;
 
 mod line_parser;
@@ -43,20 +46,28 @@ mod trie;
 
 use crate::trie::{Trie, TrieKey};
 
+const MAX_LINES: usize = 1_000_000;
+
+const AFTER_HELP: &str = "
+Examples:
+    logdiver path/to/some/executable
+    logdiver -- path/to/some/executable --parameter-to-executable=1
+";
+
 #[derive(Debug, Parser)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None, after_help = AFTER_HELP)]
 struct LogdiverArgs {
     /// Path to source of application that is being run
     #[arg(short = 's', long)]
     source: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, hide = true)]
     debug_notify: bool,
 
-    #[arg(long)]
+    #[arg(long, hide = true)]
     debug_capturer: bool,
 
-    #[arg(long)]
+    #[arg(long, hide = true)]
     daemon: bool,
 
     values: Vec<String>,
@@ -166,15 +177,20 @@ fn fingerprint(line: &str, fingerprint: &mut Vec<TrieKey>) -> Option<()> {
     }
 }
 
-#[derive(Savefile, Default, Clone)]
+#[derive(Savefile, Default, Clone, Debug)]
 struct MatchSequence {
     range: Vec<(u32, u32)>,
 }
 
 impl MatchSequence {
+    pub fn clear(&mut self) {
+        self.range.clear();
+    }
+    #[allow(unused)]
     pub fn is_empty(&self) -> bool {
         self.range.is_empty()
     }
+    #[allow(unused)]
     pub(crate) fn visit(&self, len: usize, mut visitor: impl FnMut(usize, usize, bool)) {
         let mut expected_start = 0;
         for (start, end) in &self.range {
@@ -229,6 +245,7 @@ impl State {
         let mut tps = Vec::new();
         fingerprint_trie.search_fn(&line.message, |hit, m| {
             tps.push((hit.tracepoint, m.clone()));
+            true
         });
 
         if !tps.is_empty() {
@@ -245,19 +262,20 @@ impl State {
     /// Check if 'line' matches the filter, and adds it to the `matching_lines`
     fn check_matching(
         fingerprint_trie: &mut Trie<TracePoint>,
-        matching_lines: &mut Vec<Arc<LogLine>>,
+        matching_lines: &mut VecDeque<Arc<LogLine>>,
         trace_point_data: &mut [TracePointData],
         line: &Arc<LogLine>,
     ) {
 
         let mut any_hit = false;
-        fingerprint_trie.search_fn(&line.message, |hit, _m| {
+        let len = trace_point_data.iter().filter(|x|x.active).count();
+        fingerprint_trie.search_fn_fast(&line.message, |hit| {
             trace_point_data[hit.tracepoint as usize].matches += 1;
             any_hit = true;
-        });
+        }, len);
 
         if any_hit {
-            matching_lines.push(line.clone());
+            matching_lines.push_back(line.clone());
         }
     }
     fn add_tracepoint_trie(trie: &mut Trie<TracePoint>, tp: &TracePointData) {
@@ -339,6 +357,50 @@ impl State {
         self.rebuild_matches();
     }
 
+    fn focus_current_tracepoint(&mut self, back: bool) -> Option<usize> {
+        if let Some(filter) = self.selected_filter {
+            if self.matching_lines.is_empty() {
+                return None;
+            }
+            let mut start = self.selected_output.unwrap_or(if back  {0} else {self.matching_lines.len().saturating_sub(1)} );
+
+            let mut trie = Trie::new();
+            Self::add_tracepoint_trie(&mut trie, &self.tracepoints[filter]);
+            let mut visited_count = 0;
+            let total_count = self.matching_lines.len();
+            let mut cur = start;
+            let mut next = ||{
+                if visited_count == total_count {
+                    return None;
+                }
+                visited_count +=1;
+                if back {
+                    cur = cur.checked_sub(1).unwrap_or(total_count.saturating_sub(1));
+                } else {
+                    cur=cur + 1;
+                    if cur >= total_count {
+                        cur = 0;
+                    }
+                }
+                Some(cur)
+            };
+
+
+            while let Some(i) = next() {
+                let message = &self.matching_lines[i];
+                let mut have_hit = false;
+                trie.search_fn_fast(&message.message, |hit| {
+                    have_hit = true;
+                }, 1);
+                if have_hit {
+                    self.selected_output = Some(i);
+                    return Some(i);
+                }
+            };
+        }
+        None
+    }
+
     fn save(&self) {
         let mut f = BufWriter::new(File::create(LOGDIVER_FILE).unwrap());
         std::fs::write("telltale.txt", format!("{:?}", self.tracepoints)).unwrap();
@@ -365,99 +427,182 @@ fn mainloop(program_lines: mpsc::Receiver<DiverEvent>, state: Arc<Mutex<State>>)
                 state.add_tracepoint(tp);
                 state.save();
             }
-            DiverEvent::ProgramOutput(line) => {
-                let line = Arc::new(line);
-                State::check_matching(
-                    &mut state.fingerprint_trie,
-                    &mut state.matching_lines,
-                    &mut state.tracepoints,
-                    &line,
-                );
-                state.all_lines.push_back(line);
-                state.generation += 1;
+            DiverEvent::ProgramOutput(lines) => {
+                lines.with_each(|line|{
+                    state.total += 1;
+                    if state.pause {
+                        return;
+                    }
+                    let line = Arc::new(line);
+                    State::check_matching(
+                        &mut state.fingerprint_trie,
+                        &mut state.matching_lines,
+                        &mut state.tracepoints,
+                        &line,
+                    );
+                    state.all_lines.push_back(line);
+                    if state.all_lines.len() > MAX_LINES {
+                        state.all_lines.pop_front();
+                    }
+                    if state.matching_lines.len() > MAX_LINES {
+
+                        let front = state.matching_lines.pop_front().unwrap();
+                        for m in State::get_matches(&mut state.fingerprint_trie, &*front) {
+                            state.tracepoints[m.tp as usize].matches -= 1;
+                        }
+                    }
+                    state.generation += 1;
+                });
             }
         }
     }
 }
 
-fn capturer(child_out: impl Read, program_lines: mpsc::SyncSender<DiverEvent>, _is_stdout: bool) {
+#[derive(Default)]
+struct ReadManyLines {
+    scratch: Vec<u8>,
 
+}
 
-    let child_out = BufReader::new(child_out);
-
-    for line in child_out.lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-
-        let line = strip_ansi_codes(&line);
-
-        let value = gjson::parse(&line);
-        let mut message = String::new();
-        let mut target = String::new();
-        let mut level = String::new();
-        let mut timestamp = String::new();
-        let mut fields = String::new();
-        value.each(|key, value| {
-            match key.str() {
-                "fields" => {
-                    value.each(|key, value| {
-                        if key.str() == "message" {
-                            message = value.to_string();
-                        } else {
-                            use std::fmt::Write;
-                            write!(&mut fields, "{} = {}, ", key.str(), value.str()).unwrap();
-                        }
-                        true
-                    });
-                }
-                "target" => {
-                    target = value.to_string();
-                }
-                "level" => {
-                    level = value.to_string();
-                }
-                "timestamp" => {
-                    timestamp = value.to_string();
-                }
-                _ => {}
-            };
-            true
-        });
-
-        // If no message was extracted from JSON, use the entire line as the message
-        if message.is_empty() {
-
-            // At some point we may figure out how to correctly parse "pretty" tracing
-            // output and/or "full" tracing output (i.e, non json based):
-            /*if let Some(line) = parse_log_line(&line) {
-                timestamp = line.time;
-                target = line.namespace;
-                level = line.level;
-                message = line.message;
-                fields = line.meta;
-            } else {*/
-
-            timestamp = "".to_string();
-            target = "".to_string();
-            level = "".to_string();
-            message = line;
-            fields = "".to_string();
-
-            //}
+impl ReadManyLines  {
+    fn append(candidate: &[u8], f: &mut impl FnMut(&str)) {
+        match String::from_utf8_lossy(candidate){
+            Cow::Borrowed(x) => {
+                f(x);
+            }
+            Cow::Owned(o) => {
+                f(&o);
+            }
         }
+    }
+    fn read_many_lines<T:Read>(&mut self, read: &mut BufReader<T>, mut f: impl FnMut(&str)) -> Result<()> {
+        let mut buf = read.fill_buf()?;
+        let mut l = 0;
+        let mut limit = 0;
+        while let Some(index) = memchr(b'\n', buf) {
+            if !self.scratch.is_empty() {
+                self.scratch.extend(&buf[..index]);
+                Self::append(&self.scratch, &mut f);
+                self.scratch.clear();
+            } else {
+                Self::append( &buf[..index], &mut f);
+            }
+            buf = &buf[index + 1..];
+            l += index + 1;
+            limit += 1;
+            if limit > 200 {
+                read.consume(l);
+                return Ok(());
+            }
+
+        }
+        if !buf.is_empty() {
+            l += buf.len();
+            self.scratch.extend(buf);
+        }
+        read.consume(l);
+
+        Ok(())
+    }
+}
+
+fn capturer(child_out: impl Read, program_lines: mpsc::SyncSender<DiverEvent>, _is_stdout: bool) -> Result<()>{
+
+
+    let mut child_out = BufReader::new(child_out);
+
+    let mut line_buf = ReadManyLines::default();
+
+
+    loop {
+
+        let mut loglines = LogLines::None;
+
+        //let mut count = 0;
+        line_buf.read_many_lines(&mut child_out, |raw_line|{
+            {
+                let line:&str;
+                let temp;
+                if memchr(b'\x1b', raw_line.as_bytes()).is_none() {
+                    line = raw_line;
+                } else {
+                    temp = strip_ansi_codes(&raw_line);
+                    line = &temp;
+                };
+                /*count += 1;
+                let line = format!("{}:{}",line, count);*/
+
+                let value = gjson::parse(&line);
+                let mut message = String::new();
+                let mut target = String::new();
+                let mut level = String::new();
+                let mut timestamp = String::new();
+                let mut fields = String::new();
+                value.each(|key, value| {
+                    match key.str() {
+                        "fields" => {
+                            value.each(|key, value| {
+                                if key.str() == "message" {
+                                    message = value.to_string();
+                                } else {
+                                    use std::fmt::Write;
+                                    write!(&mut fields, "{} = {}, ", key.str(), value.str()).unwrap();
+                                }
+                                true
+                            });
+                        }
+                        "target" => {
+                            target = value.to_string();
+                        }
+                        "level" => {
+                            level = value.to_string();
+                        }
+                        "timestamp" => {
+                            timestamp = value.to_string();
+                        }
+                        _ => {}
+                    };
+                    true
+                });
+
+                // If no message was extracted from JSON, use the entire line as the message
+                if message.is_empty() {
+
+                    // At some point we may figure out how to correctly parse "pretty" tracing
+                    // output and/or "full" tracing output (i.e, non json based):
+                    /*if let Some(line) = parse_log_line(&line) {
+                        timestamp = line.time;
+                        target = line.namespace;
+                        level = line.level;
+                        message = line.message;
+                        fields = line.meta;
+                    } else {*/
+
+                    timestamp = "".to_string();
+                    target = "".to_string();
+                    level = "".to_string();
+                    message = line.to_string();
+                    fields = "".to_string();
+
+                    //}
+                }
+                loglines.append(LogLine {
+                    time: timestamp,
+                    target,
+                    level,
+                    message,
+                    fields,
+                });
+            }
+
+        })?;
+
+
 
         program_lines
-            .send(DiverEvent::ProgramOutput(LogLine {
-                time: timestamp,
-                target,
-                level,
-                message,
-                fields,
-            }))
+            .send(DiverEvent::ProgramOutput(loglines))
             .unwrap();
     }
-
 }
 
 #[derive(Savefile, Debug, Clone)]
@@ -469,7 +614,49 @@ struct TracePoint {
 
 pub enum DiverEvent {
     SourceChanged(TracePointData),
-    ProgramOutput(LogLine),
+    ProgramOutput(LogLines),
+}
+enum LogLines {
+    None,
+    Line(LogLine),
+    Lines(Vec<LogLine>)
+}
+
+impl LogLines {
+    pub fn with_each(self, mut f: impl FnMut(LogLine)) {
+        match self {
+            LogLines::None => {}
+            LogLines::Line(l) => {
+                f(l);
+            }
+            LogLines::Lines(v) => {
+                for x in v {
+                    f(x)
+                }
+
+            }
+        }
+    }
+    pub fn append(&mut self, logline: LogLine) {
+        match self {
+            LogLines::None => {
+                *self = LogLines::Line(logline);
+            }
+            LogLines::Line(line0) => {
+                let line = std::mem::replace(self, LogLines::None);
+                if let LogLines::Line(line0) = line {
+                    *self = LogLines::Lines(vec![
+                        line0, logline
+                    ]);
+                } else {
+                    unreachable!()
+                };
+            }
+            LogLines::Lines(v) => {
+                v.push(logline);
+            }
+        }
+    }
 }
 
 #[derive(Savefile, Clone, PartialEq)]
@@ -533,7 +720,7 @@ impl Display for Fingerprint {
 }
 
 #[derive(Savefile, Clone, Debug)]
-struct TracePointData {
+pub struct TracePointData {
     fingerprint: Fingerprint,
 
     tp: TracePoint,
@@ -542,7 +729,7 @@ struct TracePointData {
 }
 
 #[derive(Clone)]
-struct LogLine {
+pub struct LogLine {
     time: String,
     target: String,
     level: String,
@@ -570,6 +757,7 @@ struct TpMatch {
     hits: MatchSequence,
 }
 
+
 #[derive(Default, Savefile)]
 struct State {
     #[savefile_ignore]
@@ -580,12 +768,16 @@ struct State {
     all_lines: VecDeque<Arc<LogLine>>,
     #[savefile_ignore]
     #[savefile_introspect_ignore]
-    matching_lines: Vec<Arc<LogLine>>,
+    total: usize,
+    #[savefile_ignore]
+    #[savefile_introspect_ignore]
+    matching_lines: VecDeque<Arc<LogLine>>,
     tracepoints: Vec<TracePointData>,
     #[savefile_ignore]
     generation: u64,
     active_window: Window,
     selected_filter: Option<usize>,
+    #[savefile_ignore]
     selected_output: Option<usize>,
     show_target: bool,
     plain: bool,
@@ -593,22 +785,9 @@ struct State {
     do_filter: bool,
     #[savefile_ignore]
     sidescroll: usize,
-}
-fn main() -> Result<()> {
-    let res = match catch_unwind(run_main) {
-        Ok(err) => err,
-        Err(err) => {
-            if let Some(err) = err.downcast_ref::<String>() {
-                Err(anyhow!("Panic: {err}"))
-            } else if let Some(err) = err.downcast_ref::<&'static str>() {
-                Err(anyhow!("Panic: {err}"))
-            } else {
-                Err(anyhow!("panic!"))
-            }
-        }
-    };
-    ratatui::restore();
-    res
+    light_mode: Option<bool>,
+    #[savefile_ignore]
+    pause: bool
 }
 
 #[derive(Eq, PartialEq, Clone)]
@@ -675,6 +854,9 @@ struct BufferInner {
     buffer: VecDeque<BufferElement>,
 }
 struct ClientHandle {
+    // The handle must be retained to make the client count
+    // knowable
+    #[allow(unused)]
     handle: Weak<()>,
     next_index: usize,
 }
@@ -685,7 +867,7 @@ struct Buffer {
 }
 impl Buffer {
     fn new_client(&self) -> ClientHandle {
-        let mut inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         ClientHandle {
             handle: Arc::downgrade(&inner.clients),
             next_index: inner.start_index + inner.buffer.len(),
@@ -763,7 +945,7 @@ fn scan_source(pathbuf: PathBuf, buffer: Arc<Buffer>, debug: bool) {
                 let mut tasks_guard = tasks.lock().unwrap();
 
                 let work_remaining = tasks_guard.len();
-                let mut count = (work_remaining >> shift).max(1).min(work_remaining);
+                let count = (work_remaining >> shift).max(1).min(work_remaining);
 
                 if count == 0 {
                     if (in_prog.load(Ordering::Relaxed) as u64) <= thread {
@@ -819,7 +1001,7 @@ fn scan_source(pathbuf: PathBuf, buffer: Arc<Buffer>, debug: bool) {
         }));
     }
     let mut tot_results = IndexMap::new();
-    for mut thread in threads {
+    for thread in threads {
         tot_results.extend(thread.join().unwrap());
     }
     if debug {
@@ -978,8 +1160,13 @@ impl Drop for KillOnDrop {
     }
 }
 
-fn run_main() -> Result<()> {
+fn main() -> Result<()> {
+
     let args = LogdiverArgs::parse();
+    if args.values.is_empty() {
+        eprintln!("Please provide the name of the application to run as an argument");
+        std::process::exit(1);
+    }
     let src = args.source.clone().unwrap_or(".".into());
     // Add a path to be watched. All files and directories at that path and
     // below will be monitored for changes.
@@ -991,8 +1178,15 @@ fn run_main() -> Result<()> {
                 state.rebuild_trie();
                 state
             })
-            .unwrap_or(State::default()),
+            .unwrap_or_else(
+                |_e|{let mut t = State::default();
+                    t.plain = true;
+                    t
+                }),
     ));
+    let light_mode =
+        state.lock().unwrap().light_mode.unwrap_or_else(||
+        terminal_light::luma().map(|luma| luma > 0.6).unwrap_or(false));
 
     if args.daemon {
         run_daemon(args.source.unwrap().into(), args.debug_notify);
@@ -1027,15 +1221,13 @@ fn run_main() -> Result<()> {
                     break;
                 }
                 Err(error) => {
-                    eprintln!("Failed to connect to server, {}", error);
+                    if iter > 0 {
+                        eprintln!("Failed to connect to server, {}", error);
+                    }
                 }
             }
         }
         if iter == 0 {
-            println!(
-                "Current exe: {}",
-                std::env::current_exe().unwrap().display()
-            );
             std::thread::sleep(Duration::from_secs(2));
             Command::new(std::env::current_exe()?)
                 .args(&[
@@ -1053,7 +1245,7 @@ fn run_main() -> Result<()> {
     }
 
     let mut arg_iter = args.values.into_iter();
-    let cmd = arg_iter.next().expect("need at least one argumnet");
+    let cmd = arg_iter.next().expect("need at least one argument");
     let rest: Vec<_> = arg_iter.collect();
     let mut child = Command::new(&cmd)
         .args(&rest)
@@ -1089,23 +1281,38 @@ fn run_main() -> Result<()> {
         mainloop(diver_events_rx, state2);
     });
 
-    let terminal = ratatui::init();
+    let res = match catch_unwind(||{
+        let terminal = ratatui::init();
+        run(terminal, state, child, light_mode)
+    }) {
+        Ok(err) => err,
+        Err(err) => {
+            if let Some(err) = err.downcast_ref::<String>() {
+                Err(anyhow!("Panic: {err}"))
+            } else if let Some(err) = err.downcast_ref::<&'static str>() {
+                Err(anyhow!("Panic: {err}"))
+            } else {
+                Err(anyhow!("panic!"))
+            }
+        }
+    };
+    ratatui::restore();
 
-    run(terminal, state, child)?;
-
-    Ok(())
+    res
 }
 
+
+
 trait BlockExt: Sized {
-    fn highlight<T: Eq>(self, our_index: T, active_highlight: T) -> Self;
+    fn highlight<T: Eq>(self, our_index: T, active_highlight: T, color_style: &ColorStyle) -> Self;
 }
 
 impl<'a> BlockExt for Block<'a> {
-    fn highlight<T: Eq>(self, our_index: T, active_highlight: T) -> Block<'a> {
+    fn highlight<T: Eq>(self, our_index: T, active_highlight: T, style: &ColorStyle) -> Block<'a> {
         if our_index == active_highlight {
-            self.border_style(defstyle().bg(Color::White).fg(Color::Black))
+            self.border_style(style.default_selected_style)
         } else {
-            self
+            self.border_style(style.default_style)
         }
     }
 }
@@ -1117,13 +1324,6 @@ fn popup_area(area: Rect, percent_x: u16) -> Rect {
     area
 }
 
-fn color_by_index(index: u32) -> Rgb {
-    let colour = (index.wrapping_mul(57)) as f32;
-    let hsl = Hsl::new(RgbHue::from_degrees(colour), 1.0, 0.4);
-    use ratatui::palette::convert::FromColorUnclamped;
-    let rgb = Rgb::from_color_unclamped(hsl);
-    rgb
-}
 
 fn combine(color: &mut Rgb, other_color: Rgb) {
     color.red += other_color.red;
@@ -1131,10 +1331,93 @@ fn combine(color: &mut Rgb, other_color: Rgb) {
     color.blue += other_color.blue;
 }
 
+struct ColorScheme {
+    light: bool,
+    bg_color: Color,
+    selected_bg_color: Color,
+    base_text_color: Color,
+}
+struct ColorStyle {
+    scheme: ColorScheme,
+    default_style: Style,
+    default_selected_style: Style,
+}
+impl ColorStyle {
+    pub fn new(scheme: ColorScheme) -> Self {
+        Self {
+            default_style: Style::from((
+                scheme.base_text_color,
+                scheme.bg_color,
+                )),
+            default_selected_style: Style::from(
+                (
+                    scheme.base_text_color,
+                    scheme.selected_bg_color,
+                    )
+            ),
+            scheme,
+        }
+    }
+    pub fn color_by_index(&self, index: u32) -> Rgb {
+        let colour = (index.wrapping_mul(57)) as f32;
+        let hsl = Hsl::new(RgbHue::from_degrees(colour), 1.0, 0.4);
+        use ratatui::palette::convert::FromColorUnclamped;
+        let rgb = Rgb::from_color_unclamped(hsl);
+        self.scheme.normalize_text_color(rgb)
+    }
+}
+impl ColorScheme {
+    pub fn new(light: bool) -> Self {
+        if light {
+            Self {
+                light,
+                bg_color: Color::Rgb(255,255,255),
+                selected_bg_color: Color::Rgb(215,215,215),
+                base_text_color: Color::Rgb(0,0,0),
+            }
+        } else {
+            Self {
+                light,
+                bg_color: Color::Rgb(0,0,0),
+                selected_bg_color: Color::Rgb(70,70,70),
+                base_text_color: Color::Rgb(192,192,192),
+            }
+        }
+    }
+    fn normalize_text_color(&self, color: Rgb) -> Rgb {
+        let intensity = color.red + color.green + color.blue;
+        if self.light {
+            if intensity > 1.0 {
+                let f = 1.0 / intensity;
+                Rgb::new(f*color.red, f*color.green, f*color.blue)
+            } else {
+                color
+            }
+        } else {
+            // DARK
+            if intensity > 3.0 {
+                let f = 3.0 / intensity;
+                Rgb::new(f*color.red, f*color.green, f*color.blue)
+            } else if intensity < 1e-3 {
+                Rgb::new(0.75,0.75,0.75)
+            } else if intensity < 1.0 {
+                let f = 1.0 / intensity;
+                Rgb::new(f*color.red, f*color.green, f*color.blue)
+            }
+            else
+            {
+                color
+            }
+
+        }
+    }
+}
+
 fn run(
     mut terminal: DefaultTerminal,
     state: Arc<Mutex<State>>,
     mut child: KillOnDrop,
+    mut light_mode: bool,
 ) -> Result<()> {
     let rows: [Row; 0] = [];
 
@@ -1143,6 +1426,8 @@ fn run(
         AddNewFilter(TextArea<'static>),
     }
 
+    let mut color_scheme = ColorScheme::new(light_mode);
+    let mut color_style = ColorStyle::new(color_scheme);
     let mut filter_table_state = TableState::default();
     let mut output_table_state = TableState::default();
     let mut last_generation = u64::MAX;
@@ -1156,11 +1441,15 @@ fn run(
         output_table_state.select(state.selected_output);
     }
 
+
+
     let mut row_space = 0;
     loop {
+
+
         {
             let mut state = state.lock().unwrap();
-            let mut state = &mut *state;
+            let state = &mut *state;
             let filter_table = Table::new(
                 rows.clone(),
                 [
@@ -1172,14 +1461,20 @@ fn run(
             .block(
                 Block::bordered()
                     .title("Filters")
-                    .title_bottom("A - Add filter")
-                    .highlight(Window::Filter, state.active_window),
+                    .title_bottom("A - Add filter, O - Focus Selected")
+                    .highlight(Window::Filter, state.active_window, &color_style)
+
+                ,
             )
             .header(Row::new(vec!["Active", "Matches", "Fingerprint"]))
-            .highlight_symbol(">");
+            .highlight_symbol(">")
+                .style(color_style.default_style);
 
             let newsize = terminal.size()?;
-            if last_generation != state.generation || lastsize != newsize {
+            if (last_generation != state.generation || lastsize != newsize) &&
+                newsize.width > 20 && newsize.height > 8
+
+                {
                 lastsize = newsize;
                 terminal.draw( |frame|{
 
@@ -1224,7 +1519,9 @@ fn run(
                     }
                     let offset = output_table_state.offset().min(matching_line_count.saturating_sub(1));
 
-                    let stats = [("Total", state.all_lines.len().to_string()), ("Shown", matching_line_count.to_string()),
+                    let stats = [
+                        ("Total", state.total.to_string()),
+                        ("Captured", state.all_lines.len().to_string()), ("Shown", matching_line_count.to_string()),
                         ("Status",
                          {
                              match child.0.try_wait() {
@@ -1249,18 +1546,23 @@ fn run(
                         ),
                         ("Filter",
                         if state.do_filter {"active".to_string()} else {"no".to_string()}),
+                        ("Light",
+                            light_mode.to_string()
+                        )
                     ];
                     render_cnt += 1;
-                    frame.render_widget(Block::bordered().title("Stats"), stats_area);
-                    let mut cur_stat_area = Rect::new(stats_area.x+1, stats_area.y+1, stats_area.width-2, 1);
+                    frame.render_widget(Block::bordered().title("Stats")
+                                            .style(color_style.default_style), stats_area)
+                    ;
+                    let mut cur_stat_area = Rect::new(stats_area.x+1, stats_area.y+1, stats_area.width.saturating_sub(2), 1);
                     for (key,val ) in stats {
                         let mut key_area = cur_stat_area;
                         key_area.width = 10;
                         let mut value_area = cur_stat_area;
                         value_area.x = 9;
-                        value_area.width -= 9;
-                        frame.render_widget(Paragraph::new(format!("{}:", key)), key_area);
-                        frame.render_widget(Paragraph::new(val), value_area);
+                        value_area.width = value_area.width.saturating_sub(9);
+                        frame.render_widget(Paragraph::new(format!("{}:", key)).style(color_style.default_style), key_area);
+                        frame.render_widget(Paragraph::new(val).style(color_style.default_style), value_area);
                         cur_stat_area.y += 1;
                     }
 
@@ -1277,20 +1579,20 @@ fn run(
                             let line = &*mline;
                             let matches = State::get_matches(&mut state.fingerprint_trie, &*line);
                             let bgcolor = if Some(i) == selected {
-                                Color::Rgb(230,230,230)
+                                color_style.scheme.selected_bg_color
                             }  else {
-                                Color::Rgb(255,255,255)
+                                color_style.scheme.bg_color
                             };
                             let mut message_line = Line::default();
 
-                            let mut byte_offset = mline.message.chars().take(state.sidescroll).map(|x|x.len_utf8()).sum::<usize>();
+                            let byte_offset = mline.message.chars().take(state.sidescroll).map(|x|x.len_utf8()).sum::<usize>();
 
                             let mut char_colors = vec![Rgb::<Srgb>::new(0.0,0.0,0.0);line.message.len()];
 
                             if line.message.len() > 0 {
                                 for tp_match in matches.iter()
                                 {
-                                    let col = color_by_index(tp_match.tp);
+                                    let col = color_style.color_by_index(tp_match.tp);
                                     for (start,end) in tp_match.hits.range.iter() {
                                         let end = (*end).min(char_colors.len() as u32); //TODO: Don't clamp here, it would be a bug if needed
                                         for c in &mut char_colors[*start as usize .. end as usize] {
@@ -1306,7 +1608,7 @@ fn run(
                                 let l = contents.into_iter().count();
 
                                 let mut start = cur_index;
-                                let mut end = cur_index + l;
+                                let end = cur_index + l;
                                 cur_index += l;
                                 if end <= byte_offset {
                                     continue;
@@ -1316,7 +1618,7 @@ fn run(
                                 }
                                 message_line.push_span(Span::styled(
                                     &line.message[start..end], {
-                                        defstyle().fg(Color::from(*chunk_key))
+                                        defstyle().fg(Color::from(color_style.scheme.normalize_text_color(*chunk_key)))
                                             .bg(bgcolor)
                                     }
                                 ));
@@ -1327,9 +1629,9 @@ fn run(
                     } else {
                         for (i,line) in state.all_lines.iter().skip(offset).take(row_space).enumerate() {
                             let bgcolor = if Some(i) == selected {
-                                Color::Rgb(230,230,230)
+                                color_style.scheme.selected_bg_color
                             }  else {
-                                Color::Rgb(255,255,255)
+                                color_style.scheme.bg_color
                             };
                             add_line(&state, &mut rows, &line, bgcolor, Line::raw(&
                                 line.message
@@ -1367,7 +1669,7 @@ fn run(
                     let output_table = Table::new(rows.clone(),
                                                   output_cols
                     )
-                        .block(Block::bordered().title("Output").highlight(Window::Output, state.active_window)
+                        .block(Block::bordered().title("Output").highlight(Window::Output, state.active_window, &color_style)
                             .title_bottom(format!("{} / {}, T - show target, F - toggle filter, P - plain, I - fields",
                                                   selected_opt.map(|x|x.to_string()).unwrap_or_default(), matching_line_count
                             ))
@@ -1376,7 +1678,8 @@ fn run(
                             col_headings
 
                         ))
-                        .highlight_symbol(">");
+                        .highlight_symbol(">")
+                        .style(color_style.default_style);
 
                     frame.render_stateful_widget(output_table.clone().
                         rows(rows.clone()), output_area, &mut fixed_output_table_state);
@@ -1386,14 +1689,17 @@ fn run(
                     for (i, tracepoint) in state.tracepoints.iter().enumerate() {
 
                         let bgcolor = if Some(i) == selected {
-                            Color::Rgb(230,230,230)
+                            color_style.scheme.selected_bg_color
                         }  else {
-                            Color::Rgb(255,255,255)
+                            color_style.scheme.bg_color
                         };
                         rows.push(Row::new([
                             Line::raw(if tracepoint.active {"X".to_string()} else {"".to_string()}),
                             Line::raw(tracepoint.matches.to_string()),
-                            Line::raw(tracepoint.fingerprint.to_string()).set_style(defstyle().fg(color_by_index(tracepoint.tp.tracepoint).into()).bg(bgcolor)),
+                            Line::raw(tracepoint.fingerprint.to_string()).set_style(
+
+                                defstyle().fg(color_style.color_by_index(tracepoint.tp.tracepoint).into()).bg(bgcolor))
+                            ,
                         ]).bg(bgcolor));
                     }
 
@@ -1417,10 +1723,14 @@ fn run(
             let event = event::read()?;
             let mut state = state.lock().unwrap();
             last_generation = u64::MAX;
+            if let Event::Key(_) = &event {
+                state.generation += 1;
+            }
             match &event {
                 Event::Key(KeyEvent {
                     kind: KeyEventKind::Press,
                     code,
+                    modifiers,
                     ..
                 }) => match &mut gui_state {
                     GuiState::Normal => match code {
@@ -1485,6 +1795,10 @@ fn run(
                             state.plain = !state.plain;
                             state.save();
                         }
+                        KeyCode::Pause | KeyCode::Char('s') | KeyCode::Char('S') => {
+                            state.pause = !state.pause;
+                            state.save();
+                        }
                         KeyCode::Char('I') | KeyCode::Char('i') => {
                             state.fields = !state.fields;
                             state.rebuild_matches();
@@ -1492,6 +1806,22 @@ fn run(
                         }
                         KeyCode::Char('F') | KeyCode::Char('f') => {
                             state.do_filter = !state.do_filter;
+                            state.save();
+                        }
+                        KeyCode::Char('O') | KeyCode::Char('o') => {
+                            if let Some(sel) = state.focus_current_tracepoint(
+                                modifiers.contains(KeyModifiers::SHIFT)
+                            ) {
+                                state.do_filter= true;
+                                output_table_state.select(Some(sel));
+                            }
+                            state.save();
+                        }
+                        KeyCode::Char('l') | KeyCode::Char('L') => {
+                            light_mode = !light_mode;
+                            state.light_mode = Some(light_mode);
+                            color_scheme = ColorScheme::new(light_mode);
+                            color_style = ColorStyle::new(color_scheme);
                             state.save();
                         }
                         KeyCode::Char(' ') if state.active_window == Window::Filter => {
@@ -1566,7 +1896,7 @@ fn run(
 
 fn add_line<'a>(
     state: &State,
-    mut rows: &mut Vec<Row<'a>>,
+    rows: &mut Vec<Row<'a>>,
     line: &'a LogLine,
     bgcolor: Color,
     message_line: Line<'a>,

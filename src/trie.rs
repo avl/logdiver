@@ -1,4 +1,4 @@
-use crate::MatchSequence;
+use crate::{MatchSequence, Restore};
 use memchr::memchr_iter;
 use savefile::prelude::Savefile;
 use std::{
@@ -40,26 +40,35 @@ impl<K: Debug + Default + Copy + PartialEq, V> TinyMap<K, V> {
     fn new() -> TinyMap<K, V> {
         Self::Inline(0, Default::default(), Default::default())
     }
+    #[allow(unused)]
     fn is_empty(&self) -> bool {
         match self {
             TinyMap::Inline(count, _, _) => *count == 0,
             TinyMap::Heap(keys, _) => keys.is_empty(),
         }
     }
-    fn visit<'a>(&'a self, mut visitor: impl FnMut(K, &'a V)) {
+    #[inline]
+    fn visit<'a>(&'a self, mut visitor: impl FnMut(K, &'a V) -> bool) -> bool {
         match self {
             TinyMap::Inline(count, keys, values) => {
                 for i in 0..*count {
-                    visitor(keys[i as usize], values[i as usize].as_ref().unwrap());
+                    if !visitor(keys[i as usize], values[i as usize].as_ref().unwrap()) {
+                        return false;
+                    }
                 }
+                true
             }
             TinyMap::Heap(keys, values) => {
                 for (key, val) in keys.iter().zip(values.iter()) {
-                    visitor(*key, val);
+                    if !visitor(*key, val) {
+                        return false;
+                    }
                 }
+                true
             }
         }
     }
+    #[allow(unused)]
     fn remove(&mut self, key: K) {
         match self {
             TinyMap::Inline(count, keys, vals) => {
@@ -80,6 +89,7 @@ impl<K: Debug + Default + Copy + PartialEq, V> TinyMap<K, V> {
             }
         }
     }
+    #[inline]
     fn insert(&mut self, key: K, value: V) -> bool {
         match self {
             TinyMap::Inline(count, keys, values) => {
@@ -110,6 +120,7 @@ impl<K: Debug + Default + Copy + PartialEq, V> TinyMap<K, V> {
             }
         }
     }
+    #[inline]
     fn get(&self, key: K) -> Option<&V> {
         match self {
             TinyMap::Inline(count, keys, values) => {
@@ -128,6 +139,7 @@ impl<K: Debug + Default + Copy + PartialEq, V> TinyMap<K, V> {
             }
         }
     }
+    #[inline]
     fn get_mut(&mut self, key: K) -> Option<&mut V> {
         match self {
             TinyMap::Inline(count, keys, values) => {
@@ -159,6 +171,7 @@ pub enum TrieKey {
 }
 
 impl TrieKey {
+    #[allow(unused)]
     fn exact(s: &str) -> Vec<TrieKey> {
         let mut ret = Vec::with_capacity(s.len());
         for (idx, c) in s.bytes().enumerate() {
@@ -170,25 +183,33 @@ impl TrieKey {
         }
         ret
     }
-    pub(crate) fn match_index(&self, key: &[u8], mut cb: impl FnMut(usize)) {
+    pub(crate) fn match_index(&self, key: &[u8], mut cb: impl FnMut(usize) -> bool) -> bool {
         match *self {
             TrieKey::Eof => {
                 if key.is_empty() {
                     cb(0)
+                } else {
+                    true
                 }
             }
             TrieKey::Exact(needle) => {
                 if let Some(first) = key.first() {
                     if *first == needle {
-                        cb(0);
-                        return;
+                        cb(0)
+                    } else {
+                        true
                     }
+                } else {
+                    true
                 }
             }
             TrieKey::WildcardThen(haystack_key) => {
                 for index in memchr_iter(haystack_key, key) {
-                    cb(index);
+                    if !cb(index) {
+                        return false;
+                    }
                 }
+                true
             }
             TrieKey::Any => cb(0),
         }
@@ -215,51 +236,92 @@ enum TrieNode<V> {
 pub struct Trie<V> {
     top: TrieNode<V>,
     generation: Cell<u64>,
+    match_sequence: MatchSequence,
 }
 impl<V> Default for Trie<V> {
     fn default() -> Self {
         Self::new()
     }
 }
+
+trait MatchSequenceCollector {
+    type Restore;
+    fn save(&mut self) -> Self::Restore;
+    fn restore(&mut self, restore: Self::Restore);
+    fn add(&mut self, i: u32);
+}
+struct DummyMatchSequenceCollector;
+impl MatchSequenceCollector for DummyMatchSequenceCollector {
+    type Restore = ();
+    #[inline]
+    fn save(&mut self) -> Self::Restore {
+    }
+
+    #[inline]
+    fn restore(&mut self, _restore: Self::Restore) {
+    }
+
+    #[inline]
+    fn add(&mut self, _i: u32) {
+    }
+}
+impl MatchSequenceCollector for MatchSequence {
+    type Restore = Restore;
+    fn save(&mut self) -> Restore {
+        self.save()
+    }
+    fn restore(&mut self, restore: Restore) {
+        self.restore(restore)
+    }
+
+    fn add(&mut self, i: u32) {
+        self.add(i)
+    }
+}
+
+
 impl<V> TrieNode<V> {
-    pub fn search<'a>(
+    // return false to stop traversal
+    pub fn search<'a, M: MatchSequenceCollector>(
         &'a self,
-        mut key: &[u8],
-        match_sequence: &mut MatchSequence,
-        hit: &mut impl FnMut(&'a V, &MatchSequence),
+        needle_key: &[u8],
+        match_sequence: &mut M,
+        hit: &mut impl FnMut(&'a V, &M) -> bool,
         cur_generation: u64,
-    ) {
+    ) -> bool {
         match self {
             TrieNode::Head {
                 map,
                 value,
                 generation,
             } => {
-                if generation.get() == cur_generation {
-                    return;
-                }
                 if let Some(v) = value.as_ref() {
-                    generation.set(cur_generation);
-                    hit(v, &match_sequence);
+                    if generation.get() != cur_generation {
+                        generation.set(cur_generation);
+                        if !hit(v, &match_sequence) {
+                            return false;
+                        }
+                    }
                 }
-                if key.is_empty() {
-                    return;
+                if needle_key.is_empty() {
+                    return true;
                 }
 
                 map.visit(|haystack_key, haystack_value| {
-                    //println!("Matching key: {:?} against {:?}", haystack_key, key);
-                    haystack_key.match_index(&key[0..], |index| {
-                        //println!("Found it, at index {}, cont with  {:?}", index, &key[index+1..]);
+                    haystack_key.match_index(&needle_key[0..], |index| {
                         let restore = match_sequence.save();
                         match_sequence.add(index as u32);
-                        let r = haystack_value.search(
-                            &key[index + 1..],
+                        if !haystack_value.search(
+                            &needle_key[index + 1..],
                             match_sequence,
                             hit,
                             cur_generation,
-                        );
+                        ) {
+                            return false;
+                        }
                         match_sequence.restore(restore);
-                    });
+                        true
+                    })
                 })
             }
             //compile_error!("Support wildcards");
@@ -269,35 +331,38 @@ impl<V> TrieNode<V> {
                 generation,
             } => {
                 if generation.get() == cur_generation {
-                    return;
+                    return true;
                 }
 
-                fn search_tail<'a, V>(
+                #[inline]
+                fn search_tail<'a, V, M: MatchSequenceCollector>(
                     key: &[u8],
                     tail: &[TrieKey],
-                    match_sequence: &mut MatchSequence,
-                    hit: &'_ mut impl FnMut(&'a V, &'_ MatchSequence),
+                    match_sequence: &mut M,
+                    hit: &'_ mut impl FnMut(&'a V, &'_ M) -> bool,
                     value: &'a V,
                     generation: &Cell<u64>,
                     cur_generation: u64,
-                ) {
+                ) -> bool {
                     if generation.get() == cur_generation {
-                        return;
+                        return true;
                     }
                     if tail.is_empty() {
-                        hit(value, match_sequence);
                         generation.set(cur_generation);
+                        hit(value, match_sequence);
                     } else if let Some(needle) = tail.get(0).cloned() {
-                        needle.match_index(&key[..], |index| {
+                        if !needle.match_index(&key[..], |index| -> bool {
                             if generation.get() == cur_generation {
-                                return;
+                                return true;
                             }
                             let saved = match_sequence.save();
                             match_sequence.add(index as u32);
                             let tail = &tail[1..];
                             if tail.is_empty() {
-                                hit(value, match_sequence);
                                 generation.set(cur_generation);
+                                if !hit(value, match_sequence) {
+                                    return false;
+                                }
                             } else {
                                 let key = &key[index + 1..];
                                 search_tail(
@@ -311,23 +376,28 @@ impl<V> TrieNode<V> {
                                 );
                             }
                             match_sequence.restore(saved);
-                        });
+                            true
+                        }) {
+                            return false;
+                        }
                     }
+                    true
                 }
                 search_tail(
-                    key,
+                    needle_key,
                     tail,
                     match_sequence,
                     &mut *hit,
                     value,
                     generation,
                     cur_generation,
-                );
+                )
             }
-            _ => {}
+            _ => {true}
         }
     }
 
+    #[allow(unused)]
     pub fn get(&self, key: &[TrieKey]) -> Option<&V> {
         if key.is_empty() {
             return if let TrieNode::Head { value, .. } = self {
@@ -335,7 +405,7 @@ impl<V> TrieNode<V> {
             } else if let TrieNode::Tail {
                 tail,
                 value: Some(value),
-                generation,
+                ..
             } = self
             {
                 tail.is_empty().then_some(value)
@@ -355,7 +425,7 @@ impl<V> TrieNode<V> {
             TrieNode::Tail {
                 tail,
                 value: Some(value),
-                generation,
+                ..
             } => (key == tail).then_some(value),
             TrieNode::Tail { value: None, .. } => None,
         }
@@ -365,7 +435,7 @@ impl<V> TrieNode<V> {
         if let TrieNode::Tail {
             tail,
             value,
-            generation,
+            ..
         } = self
         {
             if tail == key {
@@ -391,7 +461,7 @@ impl<V> TrieNode<V> {
         if let TrieNode::Head {
             map,
             value,
-            generation,
+            ..
         } = self
         {
             if key.is_empty() {
@@ -427,27 +497,45 @@ impl<V> Trie<V> {
         Self {
             top: TrieNode::Empty,
             generation: Cell::new(1),
+            match_sequence: Default::default(),
         }
     }
+    #[allow(unused)]
     pub fn get(&self, key: &str) -> Option<&V> {
         let key = TrieKey::exact(key);
         self.top.get(&key)
     }
-    /// 'grdmn' matches 'grodman', 'atn' matches 'attention' etc.
-    /// Return false to stop search
-    pub fn search_fn(&self, key: &str, mut hit: impl FnMut(&V, &MatchSequence)) {
+
+    pub fn search_fn(&mut self, key: &str, mut hit: impl FnMut(&V, &MatchSequence) -> bool) {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
+        self.match_sequence.clear();
         self.top.search(
             key.as_bytes(),
-            &mut MatchSequence::default(),
+            &mut self.match_sequence,
             &mut hit,
+            generation,
+        );
+    }
+    pub fn search_fn_fast(&mut self, key: &str, mut hit: impl FnMut(&V), max_hits: usize) {
+        let generation = self.generation.get() + 1;
+        self.generation.set(generation);
+        let mut hit_count = 0;
+        self.top.search(
+            key.as_bytes(),
+            &mut DummyMatchSequenceCollector,
+            &mut |v,_|{
+                hit(v);
+                hit_count += 1;
+                return hit_count < max_hits;
+            },
             generation,
         );
     }
     pub fn push(&mut self, key: &[TrieKey], value: V) {
         self.top.push(&key, value);
     }
+    #[allow(unused)]
     pub fn push_exact(&mut self, key: &str, value: V) {
         let key = TrieKey::exact(key);
         self.top.push(&key, value);

@@ -2,6 +2,7 @@
 //! This turned out to be hard to do and is a work-in-progress.
 use memchr::memchr;
 
+#[allow(unused)]
 fn could_be_filename(path: &str) -> bool {
     if !path.ends_with(':') {
         return false;
@@ -16,6 +17,7 @@ fn could_be_filename(path: &str) -> bool {
     line_no.chars().all(|c| c.is_ascii_digit())
 }
 
+#[allow(unused)]
 #[derive(Clone)]
 struct Tokens<'a> {
     s: &'a str,
@@ -94,6 +96,7 @@ impl<'a> Tokens<'a> {
     }
 }
 
+#[allow(unused)]
 #[derive(Debug)]
 pub struct Line {
     pub time: String,
@@ -104,6 +107,7 @@ pub struct Line {
     pub path: String,
     pub message: String,
 }
+#[allow(unused)]
 pub fn parse_log_line(line: &str) -> Option<Line> {
     let mut tokens = Tokens::new(line);
     let time = tokens.read_symbol()?.to_string();
