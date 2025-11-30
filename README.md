@@ -62,7 +62,7 @@ to automatically add search expressions.
 ## Feature wishlist:
 
  * Search also in un-filtered view
- * Retain selection position when enabling/disabling filter
+ * Properly support target, filenames, namespaces, trace level, and tracing fields, with searching
 
 
 

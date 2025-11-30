@@ -37,8 +37,10 @@ use std::{
     time::{Duration, Instant},
 };
 use std::borrow::Cow;
+use std::rc::Rc;
 use memchr::memchr;
 use ratatui::crossterm::event::KeyModifiers;
+use terminal_light::TlError;
 use tui_textarea::TextArea;
 
 mod line_parser;
@@ -262,9 +264,9 @@ impl State {
     /// Check if 'line' matches the filter, and adds it to the `matching_lines`
     fn check_matching(
         fingerprint_trie: &mut Trie<TracePoint>,
-        matching_lines: &mut VecDeque<Arc<LogLine>>,
+        matching_lines: &mut VecDeque<Rc<LogLine>>,
         trace_point_data: &mut [TracePointData],
-        line: &Arc<LogLine>,
+        line: &Rc<LogLine>,
     ) {
 
         let mut any_hit = false;
@@ -357,6 +359,30 @@ impl State {
         self.rebuild_matches();
     }
 
+    fn capture_sel(&self) -> Option<Rc<LogLine>> {
+        let was_sel: Option<Rc<LogLine>> = self.selected_output.and_then(|index:usize|
+            if self.do_filter {
+                self.matching_lines.get(index).cloned()
+            }else {
+                self.all_lines.get(index).cloned()
+            }
+        );
+        was_sel
+    }
+
+    fn restore_sel(&mut self, was_sel: Option<Rc<LogLine>>, output_table_state: &mut TableState, do_center: &mut bool) {
+        if let Some(sel) = was_sel {
+            let newsel = if self.do_filter {
+                self.matching_lines.iter().position(|x|Rc::ptr_eq(&sel, x))
+            } else {
+                self.all_lines.iter().position(|x|Rc::ptr_eq(&sel, x))
+            };
+            self.selected_output = newsel;
+            output_table_state.select(newsel);
+            *do_center = true;
+        }
+    }
+
     fn focus_current_tracepoint(&mut self, back: bool) -> Option<usize> {
         if let Some(filter) = self.selected_filter {
             if self.matching_lines.is_empty() {
@@ -408,10 +434,32 @@ impl State {
     }
 }
 
-fn mainloop(program_lines: mpsc::Receiver<DiverEvent>, state: Arc<Mutex<State>>) {
-    while let Ok(event) = program_lines.recv() {
-        let mut state = state.lock().unwrap();
-        let state = &mut *state;
+fn mainloop(state: &mut State, program_lines: &mut mpsc::Receiver<DiverEvent>) -> Result<(bool, u64/*ms remaining*/)> {
+    let mut counter = 0;
+
+    const SLICE_MS: u64 = 100;
+    let mut change = false;
+
+    let start = Instant::now();
+    //while let Ok(event) = program_lines.recv()
+    let mut time_remaining = SLICE_MS;
+    loop {
+        counter += 1;
+        if counter > 100 {
+            time_remaining = SLICE_MS.saturating_sub(start.elapsed().as_millis() as u64);
+            if time_remaining == 0 {
+                return Ok((change, 0));
+            }
+        }
+        let event = match program_lines.try_recv() {
+            Ok(event) => {event}
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok((change, time_remaining)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                bail!("disconnected");
+            },
+        };
+        change = true;
+
         match event {
             DiverEvent::SourceChanged(tp) => {
                 state.add_tracepoint(tp);
@@ -423,7 +471,7 @@ fn mainloop(program_lines: mpsc::Receiver<DiverEvent>, state: Arc<Mutex<State>>)
                     if state.pause {
                         return;
                     }
-                    let line = Arc::new(line);
+                    let line = Rc::new(line);
                     State::check_matching(
                         &mut state.fingerprint_trie,
                         &mut state.matching_lines,
@@ -755,13 +803,13 @@ struct State {
     fingerprint_trie: Trie<TracePoint>,
     #[savefile_ignore]
     #[savefile_introspect_ignore]
-    all_lines: VecDeque<Arc<LogLine>>,
+    all_lines: VecDeque<Rc<LogLine>>,
     #[savefile_ignore]
     #[savefile_introspect_ignore]
     total: usize,
     #[savefile_ignore]
     #[savefile_introspect_ignore]
-    matching_lines: VecDeque<Arc<LogLine>>,
+    matching_lines: VecDeque<Rc<LogLine>>,
     tracepoints: Vec<TracePointData>,
     #[savefile_ignore]
     generation: u64,
@@ -1151,7 +1199,7 @@ fn main() -> Result<()> {
     // below will be monitored for changes.
     let pathbuf = PathBuf::from(&src);
 
-    let state = Arc::new(Mutex::new(
+    let state =
         savefile::load_file(LOGDRILLER_FILE, 0)
             .map(|mut state: State| {
                 state.rebuild_trie();
@@ -1161,10 +1209,10 @@ fn main() -> Result<()> {
                 |_e|{let mut t = State::default();
                     t.plain = true;
                     t
-                }),
-    ));
+                })
+    ;
     let light_mode =
-        state.lock().unwrap().light_mode.unwrap_or_else(||
+        state.light_mode.unwrap_or_else(||
         terminal_light::luma().map(|luma| luma > 0.6).unwrap_or(false));
 
     if args.daemon {
@@ -1255,14 +1303,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let state2 = state.clone();
-    std::thread::spawn(move || {
-        mainloop(diver_events_rx, state2);
-    });
-
     let res = match catch_unwind(||{
         let terminal = ratatui::init();
-        run(terminal, state, child, light_mode)
+        run(terminal, state, child, light_mode, diver_events_rx)
     }) {
         Ok(err) => err,
         Err(err) => {
@@ -1392,11 +1435,57 @@ impl ColorScheme {
     }
 }
 
+fn render_message_line_with_color<'a>(trie: &mut Trie<TracePoint>, color_style: &ColorStyle, mline: &'a LogLine, bgcolor: Color, sidescroll: usize) -> Line<'a> {
+    let matches = State::get_matches(&mut *trie, &*mline);
+    let mut message_line = Line::default();
+
+    let byte_offset = mline.message.chars().take(sidescroll).map(|x|x.len_utf8()).sum::<usize>();
+
+    let mut char_colors = vec![Rgb::<Srgb>::new(0.0,0.0,0.0);mline.message.len()];
+
+    if mline.message.len() > 0 {
+        for tp_match in matches.iter()
+        {
+            let col = color_style.color_by_index(tp_match.tp);
+            for (start,end) in tp_match.hits.range.iter() {
+                let end = (*end).min(char_colors.len() as u32); //TODO: Don't clamp here, it would be a bug if needed
+                for c in &mut char_colors[*start as usize .. end as usize] {
+                    combine(c, col);
+                }
+            }
+        }
+    }
+
+    let  mut cur_index = 0;
+    for (chunk_key, contents) in char_colors.iter().chunk_by(|x|*x).into_iter() {
+
+        let l = contents.into_iter().count();
+
+        let mut start = cur_index;
+        let end = cur_index + l;
+        cur_index += l;
+        if end <= byte_offset {
+            continue;
+        }
+        if start < byte_offset {
+            start = byte_offset;
+        }
+        message_line.push_span(Span::styled(
+            &mline.message[start..end], {
+                defstyle().fg(Color::from(color_style.scheme.normalize_text_color(*chunk_key)))
+                    .bg(bgcolor)
+            }
+        ));
+    }
+    message_line
+}
+
 fn run(
     mut terminal: DefaultTerminal,
-    state: Arc<Mutex<State>>,
+    mut state: State,
     mut child: KillOnDrop,
     mut light_mode: bool,
+    mut program_lines: mpsc::Receiver<DiverEvent>
 ) -> Result<()> {
     let rows: [Row; 0] = [];
 
@@ -1415,7 +1504,6 @@ fn run(
     let mut gui_state = GuiState::Normal;
 
     {
-        let state = state.lock().unwrap();
         filter_table_state.select(state.selected_filter);
         output_table_state.select(state.selected_output);
     }
@@ -1423,12 +1511,16 @@ fn run(
 
 
     let mut row_space = 0;
+    let mut do_center = false;
     loop {
 
-
+        let time_remaining; //of slice
         {
-            let mut state = state.lock().unwrap();
-            let state = &mut *state;
+            let change;
+            (change, time_remaining) = mainloop(&mut state, &mut program_lines)?;
+            if change {
+                state.generation += 1;
+            }
             let filter_table = Table::new(
                 rows.clone(),
                 [
@@ -1483,20 +1575,32 @@ fn run(
                             state.all_lines.len()
                         };
 
-                    if output_table_state.selected().unwrap_or(0) >= matching_line_count {
-                        output_table_state.select(matching_line_count.checked_sub(1));
-                    }
-                    let selected_opt = output_table_state.selected();
-                    if let Some(selected) = selected_opt {
-                        let offset = output_table_state.offset().min(matching_line_count.saturating_sub(1));
-                        if selected < offset {
-                            *output_table_state.offset_mut() = selected;
+                    let offset;
+                    let selected_opt;
+                    if do_center && let Some(selected) = output_table_state.selected() &&
+                        selected < matching_line_count
+                        {
+                        do_center = false;
+                        offset = selected.saturating_sub(row_space/2).min(matching_line_count.saturating_sub(1));
+                        *output_table_state.offset_mut() = offset;
+                        selected_opt = output_table_state.selected();
+                    } else {
+                        if output_table_state.selected().unwrap_or(0) >= matching_line_count {
+                            output_table_state.select(matching_line_count.checked_sub(1));
                         }
-                        if selected >= offset + row_space {
-                            *output_table_state.offset_mut() = selected.saturating_sub(row_space.saturating_sub(1));
+                        selected_opt = output_table_state.selected();
+                        if let Some(selected) = selected_opt {
+                            let offset = output_table_state.offset().min(matching_line_count.saturating_sub(1));
+                            if selected < offset {
+                                *output_table_state.offset_mut() = selected;
+                            }
+                            if selected >= offset + row_space {
+                                *output_table_state.offset_mut() = selected.saturating_sub(row_space.saturating_sub(1));
+                            }
                         }
+                        offset = output_table_state.offset().min(matching_line_count.saturating_sub(1));
                     }
-                    let offset = output_table_state.offset().min(matching_line_count.saturating_sub(1));
+
 
                     let stats = [
                         ("Total", state.total.to_string()),
@@ -1556,54 +1660,17 @@ fn run(
                     if state.do_filter {
                         for (i,mline) in state.matching_lines.iter().skip(offset).take(row_space).enumerate() {
                             let line = &*mline;
-                            let matches = State::get_matches(&mut state.fingerprint_trie, &*line);
+
+
                             let bgcolor = if Some(i) == selected {
                                 color_style.scheme.selected_bg_color
                             }  else {
                                 color_style.scheme.bg_color
                             };
-                            let mut message_line = Line::default();
 
-                            let byte_offset = mline.message.chars().take(state.sidescroll).map(|x|x.len_utf8()).sum::<usize>();
+                            let msgline = render_message_line_with_color(&mut state.fingerprint_trie, &color_style, &*line, bgcolor, state.sidescroll);
 
-                            let mut char_colors = vec![Rgb::<Srgb>::new(0.0,0.0,0.0);line.message.len()];
-
-                            if line.message.len() > 0 {
-                                for tp_match in matches.iter()
-                                {
-                                    let col = color_style.color_by_index(tp_match.tp);
-                                    for (start,end) in tp_match.hits.range.iter() {
-                                        let end = (*end).min(char_colors.len() as u32); //TODO: Don't clamp here, it would be a bug if needed
-                                        for c in &mut char_colors[*start as usize .. end as usize] {
-                                            combine(c, col);
-                                        }
-                                    }
-                                }
-                            }
-
-                            let  mut cur_index = 0;
-                            for (chunk_key, contents) in char_colors.iter().chunk_by(|x|*x).into_iter() {
-
-                                let l = contents.into_iter().count();
-
-                                let mut start = cur_index;
-                                let end = cur_index + l;
-                                cur_index += l;
-                                if end <= byte_offset {
-                                    continue;
-                                }
-                                if start < byte_offset {
-                                    start = byte_offset;
-                                }
-                                message_line.push_span(Span::styled(
-                                    &line.message[start..end], {
-                                        defstyle().fg(Color::from(color_style.scheme.normalize_text_color(*chunk_key)))
-                                            .bg(bgcolor)
-                                    }
-                                ));
-                            }
-
-                            add_line(&state, &mut rows, &line, bgcolor, message_line);
+                            add_line(&state, &mut rows, &line, bgcolor, msgline);
                         }
                     } else {
                         for (i,line) in state.all_lines.iter().skip(offset).take(row_space).enumerate() {
@@ -1612,9 +1679,8 @@ fn run(
                             }  else {
                                 color_style.scheme.bg_color
                             };
-                            add_line(&state, &mut rows, &line, bgcolor, Line::raw(&
-                                line.message
-                            ));
+                            let msgline = render_message_line_with_color(&mut state.fingerprint_trie, &color_style, &*line, bgcolor, state.sidescroll);
+                            add_line(&state, &mut rows, &line, bgcolor, msgline);
                         }
                     }
 
@@ -1698,10 +1764,9 @@ fn run(
                 last_generation = state.generation;
             }
         }
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(time_remaining))? {
             let event = event::read()?;
-            let mut state = state.lock().unwrap();
-            last_generation = u64::MAX;
+
             if let Event::Key(_) = &event {
                 state.generation += 1;
             }
@@ -1784,7 +1849,9 @@ fn run(
                             state.save();
                         }
                         KeyCode::Char('F') | KeyCode::Char('f') => {
+                            let was_sel = state.capture_sel();
                             state.do_filter = !state.do_filter;
+                            state.restore_sel(was_sel, &mut output_table_state, &mut do_center);
                             state.save();
                         }
                         KeyCode::Char('O') | KeyCode::Char('o') => {
@@ -1805,9 +1872,11 @@ fn run(
                         }
                         KeyCode::Char(' ') if state.active_window == Window::Filter => {
                             if let Some(index) = filter_table_state.selected() {
+                                let was_sel = state.capture_sel();
                                 if let Some(tracepoint) = state.tracepoints.get_mut(index) {
                                     tracepoint.active = !tracepoint.active;
                                     state.rebuild_trie();
+                                    state.restore_sel(was_sel, &mut output_table_state, &mut do_center);
                                     state.save();
                                 }
                             }
