@@ -1142,7 +1142,7 @@ impl Drop for KillOnDrop {
 fn main() -> Result<()> {
 
     let args = LogdiverArgs::parse();
-    if args.values.is_empty() {
+    if !args.daemon && args.values.is_empty() {
         eprintln!("Please provide the name of the application to run as an argument");
         std::process::exit(1);
     }
