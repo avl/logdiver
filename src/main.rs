@@ -50,13 +50,13 @@ const MAX_LINES: usize = 1_000_000;
 
 const AFTER_HELP: &str = "
 Examples:
-    logdiver path/to/some/executable
-    logdiver -- path/to/some/executable --parameter-to-executable=1
+    logdriller path/to/some/executable
+    logdriller -- path/to/some/executable --parameter-to-executable=1
 ";
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None, after_help = AFTER_HELP)]
-struct LogdiverArgs {
+struct LogdrillerArgs {
     /// Path to source of application that is being run
     #[arg(short = 's', long)]
     source: Option<String>,
@@ -402,7 +402,7 @@ impl State {
     }
 
     fn save(&self) {
-        let mut f = BufWriter::new(File::create(LOGDIVER_FILE).unwrap());
+        let mut f = BufWriter::new(File::create(LOGDRILLER_FILE).unwrap());
         Serializer::save(&mut f, 0, self, false).unwrap();
         f.flush().unwrap();
     }
@@ -799,7 +799,7 @@ impl Ord for Debounced {
     }
 }
 
-const LOGDIVER_FILE: &str = ".logdiver.bin";
+const LOGDRILLER_FILE: &str = ".logdriller.bin";
 
 // Code credit: Claude
 fn strip_ansi_codes(s: &str) -> String {
@@ -1094,7 +1094,7 @@ fn scan_source(pathbuf: PathBuf, buffer: Arc<Buffer>, debug: bool) {
 fn run_daemon(source: PathBuf, debug: bool) {
     let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
     std::fs::write(
-        ".logdiver.port",
+        ".logdriller.port",
         tcp.local_addr().unwrap().port().to_string(),
     )
     .unwrap();
@@ -1141,7 +1141,7 @@ impl Drop for KillOnDrop {
 
 fn main() -> Result<()> {
 
-    let args = LogdiverArgs::parse();
+    let args = LogdrillerArgs::parse();
     if !args.daemon && args.values.is_empty() {
         eprintln!("Please provide the name of the application to run as an argument");
         std::process::exit(1);
@@ -1152,7 +1152,7 @@ fn main() -> Result<()> {
     let pathbuf = PathBuf::from(&src);
 
     let state = Arc::new(Mutex::new(
-        savefile::load_file(LOGDIVER_FILE, 0)
+        savefile::load_file(LOGDRILLER_FILE, 0)
             .map(|mut state: State| {
                 state.rebuild_trie();
                 state
@@ -1176,7 +1176,7 @@ fn main() -> Result<()> {
 
     loop {
         std::thread::sleep(Duration::from_millis(20));
-        if let Ok(contents) = std::fs::read_to_string(".logdiver.port") {
+        if let Ok(contents) = std::fs::read_to_string(".logdriller.port") {
             let tcpport: u16 = contents.parse::<u16>().unwrap();
             let port = tcpport;
             match TcpStream::connect(format!("127.0.0.1:{port}")) {
