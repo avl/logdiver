@@ -5,6 +5,7 @@ use std::{
     cell::Cell,
     fmt::{Debug, Formatter}
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// This is a little trie-based search structure.
 ///
@@ -12,6 +13,7 @@ use std::{
 /// It's battle tested and very fast. This may be buggy.
 ///
 /// But it was really fun to write!
+#[derive(Clone)]
 enum TinyMap<K, V> {
     Inline(u8, [K; 8], [Option<V>; 8]),
     Heap(Vec<K>, Vec<V>),
@@ -222,21 +224,51 @@ enum TrieNode<V> {
     Head {
         map: Box<TinyMap<TrieKey, TrieNode<V>>>,
         value: Option<V>,
-        generation: Cell<u64>,
+        generation: AtomicU64,
     },
     Tail {
         // Must not be empty
         tail: Vec<TrieKey>,
         value: Option<V>,
-        generation: Cell<u64>,
+        generation: AtomicU64,
     },
+}
+impl<V:Clone> Clone for TrieNode<V> {
+    fn clone(&self) -> Self {
+        match self {
+            TrieNode::Empty => {TrieNode::Empty}
+            TrieNode::Head { map, value, generation } => {
+                TrieNode::Head {
+                    map: map.clone(),
+                    value: value.clone(),
+                    generation: AtomicU64::new(generation.load(Ordering::Relaxed))
+                }
+            }
+            TrieNode::Tail { tail, value, generation } => {
+                TrieNode::Tail {
+                    tail: tail.clone(),
+                    value: value.clone(),
+                    generation: AtomicU64::new(generation.load(Ordering::Relaxed))
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Trie<V> {
     top: TrieNode<V>,
-    generation: Cell<u64>,
+    generation: AtomicU64,
     match_sequence: MatchSequence,
+}
+impl<V> Clone for Trie<V> where V: Clone{
+    fn clone(&self) -> Self {
+        Self {
+            top: self.top.clone(),
+            generation: AtomicU64::new(self.generation.load(Ordering::Relaxed)),
+            match_sequence: self.match_sequence.clone(),
+        }
+    }
 }
 impl<V> Default for Trie<V> {
     fn default() -> Self {
@@ -296,8 +328,8 @@ impl<V> TrieNode<V> {
                 generation,
             } => {
                 if let Some(v) = value.as_ref() {
-                    if generation.get() != cur_generation {
-                        generation.set(cur_generation);
+                    if generation.load(Ordering::Relaxed) != cur_generation {
+                        generation.store(cur_generation, Ordering::Relaxed); //TODO: This looks wrong, but it's ok since we never really use tries actually unsynchronized
                         if !hit(v, &match_sequence) {
                             return false;
                         }
@@ -330,7 +362,7 @@ impl<V> TrieNode<V> {
                 value: Some(value),
                 generation,
             } => {
-                if generation.get() == cur_generation {
+                if generation.load(Ordering::Relaxed) == cur_generation {
                     return true;
                 }
 
@@ -341,25 +373,25 @@ impl<V> TrieNode<V> {
                     match_sequence: &mut M,
                     hit: &'_ mut impl FnMut(&'a V, &'_ M) -> bool,
                     value: &'a V,
-                    generation: &Cell<u64>,
+                    generation: &AtomicU64,
                     cur_generation: u64,
                 ) -> bool {
-                    if generation.get() == cur_generation {
+                    if generation.load(Ordering::Relaxed) == cur_generation {
                         return true;
                     }
                     if tail.is_empty() {
-                        generation.set(cur_generation);
+                        generation.store(cur_generation, Ordering::Relaxed);
                         hit(value, match_sequence);
                     } else if let Some(needle) = tail.get(0).cloned() {
                         if !needle.match_index(&key[..], |index| -> bool {
-                            if generation.get() == cur_generation {
+                            if generation.load(Ordering::Relaxed) == cur_generation {
                                 return true;
                             }
                             let saved = match_sequence.save();
                             match_sequence.add(index as u32);
                             let tail = &tail[1..];
                             if tail.is_empty() {
-                                generation.set(cur_generation);
+                                generation.store(cur_generation, Ordering::Relaxed);
                                 if !hit(value, match_sequence) {
                                     return false;
                                 }
@@ -446,7 +478,7 @@ impl<V> TrieNode<V> {
             *self = TrieNode::Head {
                 map: Box::new(TinyMap::new()),
                 value: None,
-                generation: Cell::new(0),
+                generation: AtomicU64::new(0)
             };
             _ = self.push(&old_tail, old_value);
         }
@@ -454,7 +486,7 @@ impl<V> TrieNode<V> {
             *self = TrieNode::Tail {
                 tail: key.to_vec(),
                 value: Some(new_value),
-                generation: Cell::new(0),
+                generation: AtomicU64::new(0)
             };
             return true;
         }
@@ -481,7 +513,7 @@ impl<V> TrieNode<V> {
                         TrieNode::Tail {
                             tail: key[1..].to_vec(),
                             value: Some(new_value),
-                            generation: Cell::new(0),
+                            generation: AtomicU64::new(0)
                         },
                     );
                     true
@@ -496,7 +528,7 @@ impl<V> Trie<V> {
     pub fn new() -> Trie<V> {
         Self {
             top: TrieNode::Empty,
-            generation: Cell::new(1),
+            generation: AtomicU64::new(1),
             match_sequence: Default::default(),
         }
     }
@@ -507,8 +539,7 @@ impl<V> Trie<V> {
     }
 
     pub fn search_fn(&mut self, key: &str, mut hit: impl FnMut(&V, &MatchSequence) -> bool) {
-        let generation = self.generation.get() + 1;
-        self.generation.set(generation);
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed)+1;
         self.match_sequence.clear();
         self.top.search(
             key.as_bytes(),
@@ -518,8 +549,7 @@ impl<V> Trie<V> {
         );
     }
     pub fn search_fn_fast(&mut self, key: &str, mut hit: impl FnMut(&V), max_hits: usize) {
-        let generation = self.generation.get() + 1;
-        self.generation.set(generation);
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed)+1;
         let mut hit_count = 0;
         self.top.search(
             key.as_bytes(),
@@ -559,6 +589,7 @@ mod tests {
             if *v {
                 hit = true;
             }
+            true
         });
         assert!(hit);
     }
