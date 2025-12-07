@@ -47,7 +47,7 @@ impl<K: Debug + Default + Copy + PartialEq, V> TinyMap<K, V> {
         }
     }
     #[inline]
-    fn visit<'a>(&'a mut self, mut visitor: impl FnMut(K, &mut V) -> bool) -> bool {
+    fn visit(&mut self, mut visitor: impl FnMut(K, &mut V) -> bool) -> bool {
         match self {
             TinyMap::Inline(count, keys, values) => {
                 for i in 0..*count {
@@ -334,14 +334,13 @@ impl<V> TrieNode<V> {
                 value,
                 generation,
             } => {
-                if let Some(v) = value.as_ref() {
-                    if *generation != cur_generation {
+                if let Some(v) = value.as_ref()
+                    && *generation != cur_generation {
                         *generation = cur_generation;
-                        if !hit(v, &match_sequence) {
+                        if !hit(v, match_sequence) {
                             return false;
                         }
                     }
-                }
                 if needle_key.is_empty() {
                     return true;
                 }
@@ -389,8 +388,8 @@ impl<V> TrieNode<V> {
                     if tail.is_empty() {
                         *generation = cur_generation;
                         hit(value, match_sequence);
-                    } else if let Some(needle) = tail.get(0).cloned() {
-                        if !needle.match_index(&key[..], |index| -> bool {
+                    } else if let Some(needle) = tail.first().cloned()
+                        && !needle.match_index(key, |index| -> bool {
                             if *generation == cur_generation {
                                 return true;
                             }
@@ -419,7 +418,6 @@ impl<V> TrieNode<V> {
                         }) {
                             return false;
                         }
-                    }
                     true
                 }
                 search_tail(
@@ -480,7 +478,7 @@ impl<V> TrieNode<V> {
             if tail == key {
                 return false;
             }
-            let old_tail = std::mem::replace(tail, Default::default());
+            let old_tail = std::mem::take(tail);
             let old_value = value.take().unwrap();
             *self = TrieNode::Head {
                 map: Box::new(TinyMap::new()),
@@ -564,13 +562,13 @@ impl<V> Trie<V> {
             &mut |v,_|{
                 hit(v);
                 hit_count += 1;
-                return hit_count < max_hits;
+                hit_count < max_hits
             },
             generation,
         );
     }
     pub fn push(&mut self, key: &[TrieKey], value: V) {
-        self.top.push(&key, value);
+        self.top.push(key, value);
     }
     #[allow(unused)]
     pub fn push_exact(&mut self, key: &str, value: V) {

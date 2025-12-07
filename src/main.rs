@@ -115,12 +115,11 @@ fn parse_delta(prev: &str, now: &str, path: &Arc<PathBuf>, tx: &Buffer, debug_no
     }
     for (line_number, line) in now.lines().enumerate() {
         let line_number = line_number + 1; //Editors count 1 as first line
-        if let Some(x) = prev_lines.get_mut(line) {
-            if *x >= 1 {
+        if let Some(x) = prev_lines.get_mut(line)
+            && *x >= 1 {
                 *x -= 1;
                 continue;
             }
-        }
         let mut finger = Vec::new();
 
         fingerprint(line, &mut finger);
@@ -167,18 +166,16 @@ fn fingerprint(line: &str, fingerprint: &mut Vec<TrieKey>) -> Option<()> {
                     depth += 1;
                 } else if tok == '}' {
                     depth -= 1;
-                } else {
-                    if depth == 0 {
-                        let mut buf = [0; 4];
-                        let bytes = tok.encode_utf8(&mut buf).as_bytes();
-                        for byt in bytes {
-                            if wild {
-                                fingerprint.push(TrieKey::WildcardThen(*byt));
-                            } else {
-                                fingerprint.push(TrieKey::Exact(*byt));
-                            }
-                            wild = false;
+                } else if depth == 0 {
+                    let mut buf = [0; 4];
+                    let bytes = tok.encode_utf8(&mut buf).as_bytes();
+                    for byt in bytes {
+                        if wild {
+                            fingerprint.push(TrieKey::WildcardThen(*byt));
+                        } else {
+                            fingerprint.push(TrieKey::Exact(*byt));
                         }
+                        wild = false;
                     }
                 }
             }
@@ -301,18 +298,18 @@ impl State {
     /// Return all matches of the expressions in Trie to the 'line'
     fn get_matches(fingerprint_trie: &mut Trie<TracePoint>, line: &str) -> Vec<TpMatch> {
         let mut tps = Vec::new();
-        fingerprint_trie.search_fn(&line, |hit, m| {
+        fingerprint_trie.search_fn(line, |hit, m| {
             tps.push((hit.tracepoint, m.clone()));
             true
         });
 
         if !tps.is_empty() {
-            let matches = tps
+            
+
+            tps
                 .into_iter()
                 .map(|(tp, matchseq)| TpMatch { tp, hits: matchseq })
-                .collect();
-
-            matches
+                .collect()
         } else {
             Vec::new()
         }
@@ -505,7 +502,7 @@ impl State {
                 if back {
                     cur = cur.checked_sub(1).unwrap_or(total_count.saturating_sub(1));
                 } else {
-                    cur = cur + 1;
+                    cur += 1;
                     if cur >= total_count {
                         cur = 0;
                     }
@@ -591,7 +588,7 @@ fn mainloop(
                     }
 
                     let mut ignored = false;
-                    state.all_lines.push(&line,
+                    state.all_lines.push(line,
                                          |analyzed|{
                                              if !State::check_matching(&mut state.capture_fingerprint_trie, &mut state.tracepoints, &analyzed) {
                                                  ignored = true;
@@ -617,8 +614,8 @@ fn mainloop(
 
                     if state.all_lines.len() > MAX_LINES {
                         let next_front_id = state.all_lines.loglines.first_id() + 1;
-                        if let Some(front) = state.matching_lines.front() {
-                            if *front <= next_front_id {
+                        if let Some(front) = state.matching_lines.front()
+                            && *front <= next_front_id {
                                 let front = state.matching_lines.pop_front().unwrap();
                                 let front = state.all_lines.get_by_id(front);
                                 for col in front.cols() {
@@ -627,7 +624,6 @@ fn mainloop(
                                     }
                                 }
                             }
-                        }
                         state.all_lines.pop_front();
                     }
                     state.generation += 1;
@@ -757,7 +753,7 @@ fn capturer(
                 if memchr(b'\x1b', raw_line.as_bytes()).is_none() {
                     line = raw_line;
                 } else {
-                    temp = strip_ansi_codes(&raw_line);
+                    temp = strip_ansi_codes(raw_line);
                     line = &temp;
                 };
                 /*count += 1;
@@ -827,45 +823,7 @@ pub enum DiverEvent {
     SourceChanged(TracePointData),
     ProgramOutput(StringCarrier, usize/*channel 0 or 1*/),
 }
-enum LogLines {
-    None,
-    Line(String),
-    Lines(Vec<String>),
-}
 
-impl LogLines {
-    pub fn with_each(self, mut f: impl FnMut(String)) {
-        match self {
-            LogLines::None => {}
-            LogLines::Line(l) => {
-                f(l);
-            }
-            LogLines::Lines(v) => {
-                for x in v {
-                    f(x)
-                }
-            }
-        }
-    }
-    pub fn append(&mut self, logline: String) {
-        match self {
-            LogLines::None => {
-                *self = LogLines::Line(logline);
-            }
-            LogLines::Line(line0) => {
-                let line = std::mem::replace(self, LogLines::None);
-                if let LogLines::Line(line0) = line {
-                    *self = LogLines::Lines(vec![line0, logline]);
-                } else {
-                    unreachable!()
-                };
-            }
-            LogLines::Lines(v) => {
-                v.push(logline);
-            }
-        }
-    }
-}
 
 #[derive(Savefile, Clone, PartialEq)]
 pub struct Fingerprint(Vec<TrieKey>);
@@ -892,11 +850,10 @@ impl Fingerprint {
                 t.push(TrieKey::Exact(*c));
             }
         }
-        if t.is_empty() {
-            if s.contains('*') {
+        if t.is_empty()
+            && s.contains('*') {
                 t.push(TrieKey::Any);
             }
-        }
 
         Fingerprint(t)
     }
@@ -941,7 +898,7 @@ impl Clone for TracePointData {
         TracePointData {
             fingerprint: self.fingerprint.clone(),
             tp:self.tp.clone(),
-            active: self.active.clone(),
+            active: self.active,
             capture: self.capture,
             negative: self.negative,
             matches: AtomicUsize::new(self.matches.load(Ordering::Relaxed)),
@@ -978,9 +935,9 @@ pub mod lines {
         }
 
         let mut prev_index = 0;
-        let mut it = s.char_indices();
+        let it = s.char_indices();
 
-        while let Some((i, _)) = it.next() {
+        for (i, _) in it {
             // start index of previous iteration must be an allowed end index,
             // since it must be <= max_bytes or we would have break:ed out of the loop
             println!("i: {}", i);
@@ -1021,7 +978,7 @@ pub mod lines {
             LogLineId(self.start_id)
         }
 
-        pub fn get<'a>(&'a self, line_id: LogLineId) -> &'a str {
+        pub fn get(&self, line_id: LogLineId) -> &str {
             let offset = line_id.0 - self.start_id;
             &self[offset]
         }
@@ -1869,24 +1826,22 @@ fn scan_source(pathbuf: PathBuf, buffer: Arc<Buffer>, debug: bool) {
                     }
                     if let Ok(dir) = std::fs::read_dir(dir) {
                         for entry in dir.into_iter() {
-                            if let Ok(entry) = entry {
-                                if let Ok(meta) = entry.metadata() {
+                            if let Ok(entry) = entry
+                                && let Ok(meta) = entry.metadata() {
                                     if meta.is_dir() {
                                         process_soon.push(entry.path());
                                     }
                                     if meta.is_file() {
                                         let path = entry.path();
-                                        if path.extension() == Some(&rs) {
-                                            if let Ok(canon) = std::fs::canonicalize(path)
+                                        if path.extension() == Some(&rs)
+                                            && let Ok(canon) = std::fs::canonicalize(path)
                                                 && let Ok(contents) =
                                                     std::fs::read_to_string(&canon)
                                             {
                                                 results.insert(canon, contents);
                                             }
-                                        }
                                     }
                                 }
-                            }
                         }
                     }
                 }
@@ -1936,8 +1891,8 @@ fn scan_source(pathbuf: PathBuf, buffer: Arc<Buffer>, debug: bool) {
                     EventKind::Access(_) => {}
                     EventKind::Create(_) | EventKind::Modify(_) => {
                         for path in event.paths {
-                            if path.extension() == Some(&rs) {
-                                if let Ok(path) = std::fs::canonicalize(path)
+                            if path.extension() == Some(&rs)
+                                && let Ok(path) = std::fs::canonicalize(path)
                                     && let Ok(meta) = std::fs::metadata(&path)
                                 {
                                     if !meta.is_file() {
@@ -1950,7 +1905,6 @@ fn scan_source(pathbuf: PathBuf, buffer: Arc<Buffer>, debug: bool) {
                                         debouncing_iterations: 0,
                                     });
                                 }
-                            }
                         }
                     }
                     EventKind::Other | EventKind::Remove(_) => {}
@@ -1959,53 +1913,51 @@ fn scan_source(pathbuf: PathBuf, buffer: Arc<Buffer>, debug: bool) {
                     //TODO: Log somewhere? (probably add '--debuglog' option
                 }
             }
-        } else {
-            if let Some(mut debounced) = debouncing.pop() {
-                if debug {
-                    println!("Bounce-checking {}", debounced.path.as_path().display());
-                }
+        } else if let Some(mut debounced) = debouncing.pop() {
+            if debug {
+                println!("Bounce-checking {}", debounced.path.as_path().display());
+            }
 
-                if let Ok(meta) = std::fs::metadata(&debounced.path) {
-                    if meta.len() != debounced.size {
-                        debounced.at = Instant::now()
-                            + Duration::from_millis(
-                                (100 * (1 << debounced.debouncing_iterations)).min(2000),
-                            );
-                        debounced.size = meta.len();
-                        debounced.debouncing_iterations += 1;
-                        debouncing.push(debounced);
-                    } else {
-                        if debug {
-                            println!("Path: {}", debounced.path.as_path().display());
-                        }
-                        if let Ok(contents) = std::fs::read_to_string(&debounced.path) {
-                            match tot_results.entry(debounced.path.clone()) {
-                                Entry::Occupied(mut prev_entry) => {
-                                    let prev_value = prev_entry.get();
-                                    if contents.len() < prev_value.len().saturating_sub(40)
-                                        && debounced.debouncing_iterations < 3
-                                    {
-                                        debounced.at = Instant::now() + Duration::from_millis(2000);
-                                        debounced.size = meta.len();
-                                        debounced.debouncing_iterations = 3;
-                                        debouncing.push(debounced);
-                                        continue;
-                                    }
-                                    let path = Arc::new(debounced.path);
-
-                                    parse_delta(
-                                        prev_value,
-                                        &contents,
-                                        &path,
-                                        &mut source_line_change_tx,
-                                        false,
-                                    );
-
-                                    *prev_entry.get_mut() = contents;
+            if let Ok(meta) = std::fs::metadata(&debounced.path) {
+                if meta.len() != debounced.size {
+                    debounced.at = Instant::now()
+                        + Duration::from_millis(
+                            (100 * (1 << debounced.debouncing_iterations)).min(2000),
+                        );
+                    debounced.size = meta.len();
+                    debounced.debouncing_iterations += 1;
+                    debouncing.push(debounced);
+                } else {
+                    if debug {
+                        println!("Path: {}", debounced.path.as_path().display());
+                    }
+                    if let Ok(contents) = std::fs::read_to_string(&debounced.path) {
+                        match tot_results.entry(debounced.path.clone()) {
+                            Entry::Occupied(mut prev_entry) => {
+                                let prev_value = prev_entry.get();
+                                if contents.len() < prev_value.len().saturating_sub(40)
+                                    && debounced.debouncing_iterations < 3
+                                {
+                                    debounced.at = Instant::now() + Duration::from_millis(2000);
+                                    debounced.size = meta.len();
+                                    debounced.debouncing_iterations = 3;
+                                    debouncing.push(debounced);
+                                    continue;
                                 }
-                                Entry::Vacant(v) => {
-                                    v.insert(contents);
-                                }
+                                let path = Arc::new(debounced.path);
+
+                                parse_delta(
+                                    prev_value,
+                                    &contents,
+                                    &path,
+                                    &mut source_line_change_tx,
+                                    false,
+                                );
+
+                                *prev_entry.get_mut() = contents;
+                            }
+                            Entry::Vacant(v) => {
+                                v.insert(contents);
                             }
                         }
                     }
@@ -2081,9 +2033,9 @@ fn main() -> Result<()> {
             state
         })
         .unwrap_or_else(|_e| {
-            let t = State::default();
+            
             //t.plain = true;
-            t
+            State::default()
         });
     let light_mode = state.light_mode.unwrap_or_else(|| {
         terminal_light::luma()
@@ -2210,7 +2162,7 @@ fn main() -> Result<()> {
 }
 
 fn analyze_logline(line: &str, pos: &mut VecDeque<Range<u32>>) {
-    let value = gjson::parse(&line);
+    let value = gjson::parse(line);
     let mut message = String::new();
     let mut target = String::new();
     let mut level = String::new();
@@ -2342,14 +2294,14 @@ impl ColorScheme {
     }
 }
 
-fn render_message_line_with_color<'a>(
+fn render_message_line_with_color(
     trie: &mut Trie<TracePoint>,
     color_style: &ColorStyle,
-    mline: &'a str,
+    mline: &str,
     bgcolor: Color,
     sidescroll: usize,
 ) -> Line<'static> {
-    let matches = State::get_matches(&mut *trie, &*mline);
+    let matches = State::get_matches(&mut *trie, mline);
     let mut message_line = Line::default();
 
     let byte_offset = mline
@@ -2360,7 +2312,7 @@ fn render_message_line_with_color<'a>(
 
     let mut char_colors = vec![Rgb::<Srgb>::new(0.0, 0.0, 0.0); mline.len()];
 
-    if mline.len() > 0 {
+    if !mline.is_empty() {
         for tp_match in matches.iter() {
             let col = color_style.color_by_index(tp_match.tp);
             for (start, end) in tp_match.hits.range.iter() {
@@ -2687,7 +2639,7 @@ fn run(
                             .take(row_space)
                             .enumerate()
                         {
-                            let line = &*mline;
+                            let line = mline;
 
                             let bgcolor = if Some(i) == selected {
                                 color_style.scheme.selected_bg_color
@@ -2924,280 +2876,274 @@ fn run(
             if let Event::Key(_) = &event {
                 state.generation += 1;
             }
-            match &event {
-                Event::Key(KeyEvent {
+            if let Event::Key(KeyEvent {
                     kind: KeyEventKind::Press,
                     code,
                     modifiers,
                     ..
-                }) => match &mut gui_state {
-                    GuiState::Configure(confstate) => match code {
-                        KeyCode::Esc => {
-                            gui_state = GuiState::Normal;
+                }) = &event { match &mut gui_state {
+                GuiState::Configure(confstate) => match code {
+                    KeyCode::Esc => {
+                        gui_state = GuiState::Normal;
+                    }
+                    KeyCode::Up => {
+                        if let ParsingConfigState::Enabled(_, tablestate) = confstate {
+                            tablestate.select_previous();
                         }
-                        KeyCode::Up => {
-                            if let ParsingConfigState::Enabled(_, tablestate) = confstate {
-                                tablestate.select_previous();
-                            }
+                    }
+                    KeyCode::Down => {
+                        if let ParsingConfigState::Enabled(_, tablestate) = confstate {
+                            tablestate.select_next();
                         }
-                        KeyCode::Down => {
-                            if let ParsingConfigState::Enabled(_, tablestate) = confstate {
-                                tablestate.select_next();
-                            }
-                        }
-                        KeyCode::Char(c@'+'|c@'-') => {
-                            if let ParsingConfigState::Enabled(fields, tablestate) = confstate {
-                                if let Some(sel) = tablestate.selected() {
-                                    match *c {
-                                        '+' if sel + 1 < fields.len()=> {
-                                            fields.swap(sel, sel+1);
-                                            tablestate.select(Some(sel+1));
-                                        }
-                                        '-' if sel > 0 => {
-                                            fields.swap(sel, sel-1);
-                                            tablestate.select(Some(sel-1));
-                                        }
-                                        _ => {}
+                    }
+                    KeyCode::Char(c@'+'|c@'-') => {
+                        if let ParsingConfigState::Enabled(fields, tablestate) = confstate
+                            && let Some(sel) = tablestate.selected() {
+                                match *c {
+                                    '+' if sel + 1 < fields.len()=> {
+                                        fields.swap(sel, sel+1);
+                                        tablestate.select(Some(sel+1));
                                     }
-                                }
-                            }
-                        }
-                        KeyCode::Enter => {
-                            let conf = std::mem::replace(&mut gui_state, GuiState::Normal);
-                            let GuiState::Configure(confstate) = conf else {
-                                unreachable!()
-                            };
-                            state.raw = false;
-                            state.apply_parsing_config(confstate.to_configuration());
-                            state.rebuild_matches();
-                            state.save();
-                        }
-                        KeyCode::Char(' ') => {
-                            if let ParsingConfigState::Enabled(fields, tablestate) = confstate {
-                                if let Some(sel) = tablestate.selected() {
-                                    if let Some((active, _field)) = fields.get_mut(sel) {
-                                        *active = !*active;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
-                    GuiState::Normal => match code {
-                        KeyCode::Esc | KeyCode::Char('Q') | KeyCode::Char('q') => {
-                            break Ok(());
-                        }
-                        KeyCode::Delete if state.active_window == Window::Filter => {
-                            if let Some(index) = filter_table_state.selected() {
-                                state.tracepoints.remove(index);
-                                if index >= state.tracepoints.len() {
-                                    let new_sel = state.tracepoints.len().checked_sub(1);
-                                    state.selected_filter = new_sel;
-                                    filter_table_state.select(new_sel);
-                                }
-                                state.rebuild_trie();
-                                state.save();
-                            }
-                        }
-                        KeyCode::Right | KeyCode::Left => match code {
-                            KeyCode::Right => {
-                                state.sidescroll = state.sidescroll.saturating_add(10);
-                            }
-                            KeyCode::Left => {
-                                state.sidescroll = state.sidescroll.saturating_sub(10);
-                            }
-                            _ => {}
-                        },
-                        KeyCode::PageDown | KeyCode::PageUp => {
-                            let change = match code {
-                                KeyCode::PageDown => row_space as isize,
-                                KeyCode::PageUp => {
-                                    if state.active_window == Window::Output {
-                                        follow = false;
-                                    }
-                                    -(row_space as isize)},
-                                _ => 0,
-                            };
-                            match state.active_window {
-                                Window::Filter => {}
-                                Window::Output => {
-                                    if let Some(selected) = output_table_state.selected() {
-                                        output_table_state
-                                            .select(Some(selected.saturating_add_signed(change)));
-                                    } else {
-                                        output_table_state.select(Some(0));
-                                    }
-                                    state.selected_output = output_table_state.selected();
-                                }
-                            }
-                        }
-                        KeyCode::Home | KeyCode::End => match state.active_window {
-                            Window::Filter => {}
-                            Window::Output => {
-                                match code {
-                                    KeyCode::Home => {
-                                        if state.active_window == Window::Output {
-                                            follow = false;
-                                        }
-                                        output_table_state.select(Some(0));
-                                    }
-                                    KeyCode::End => {
-                                        output_table_state.select(Some(usize::MAX));
+                                    '-' if sel > 0 => {
+                                        fields.swap(sel, sel-1);
+                                        tablestate.select(Some(sel-1));
                                     }
                                     _ => {}
                                 }
-                                state.selected_output = output_table_state.selected();
                             }
-                        },
-                        KeyCode::Pause | KeyCode::Char('s') | KeyCode::Char('S') => {
-                            state.pause = !state.pause;
-                            state.save();
-                        }
-                        KeyCode::Char('I') | KeyCode::Char('i') => {
-                            gui_state = GuiState::Configure(state.get_parsing_configuration());
-                        }
-                        KeyCode::Char('r'|'R') => {
-                            state.raw = !state.raw;
-                            state.reapply_parsing_config();
-                            state.rebuild_matches();
-                            state.save();
-                        }
-                        KeyCode::Char('F') | KeyCode::Char('f') => {
-                            let was_sel = state.capture_sel();
-                            state.do_filter = !state.do_filter;
-                            state.restore_sel(was_sel, &mut output_table_state, &mut do_center);
-                            state.save();
-                        }
-                        KeyCode::Char('O') | KeyCode::Char('o') => {
-                            if let Some(sel) = state
-                                .focus_current_tracepoint(modifiers.contains(KeyModifiers::SHIFT))
-                            {
-                                state.do_filter = true;
-                                output_table_state.select(Some(sel));
-                            }
-                            state.save();
-                        }
-                        KeyCode::Char('l') | KeyCode::Char('L') => {
-                            light_mode = !light_mode;
-                            state.light_mode = Some(light_mode);
-                            color_scheme = ColorScheme::new(light_mode);
-                            color_style = ColorStyle::new(color_scheme);
-                            state.save();
-                        }
-                        KeyCode::Char(key@'+'|key@'-') if state.active_window == Window::Filter => {
-                            if let Some(index) = filter_table_state.selected() {
-                                let was_sel = state.capture_sel();
-                                if let Some(tracepoint) = state.tracepoints.get_mut(index) {
-                                    match key {
-                                        '+' => tracepoint.negative = false,
-                                        '-' => tracepoint.negative = true,
-                                        _ => {}
-                                    }
-                                    state.rebuild_trie();
-                                    state.restore_sel(
-                                        was_sel,
-                                        &mut output_table_state,
-                                        &mut do_center,
-                                    );
-                                    state.save();
+                    }
+                    KeyCode::Enter => {
+                        let conf = std::mem::replace(&mut gui_state, GuiState::Normal);
+                        let GuiState::Configure(confstate) = conf else {
+                            unreachable!()
+                        };
+                        state.raw = false;
+                        state.apply_parsing_config(confstate.to_configuration());
+                        state.rebuild_matches();
+                        state.save();
+                    }
+                    KeyCode::Char(' ') => {
+                        if let ParsingConfigState::Enabled(fields, tablestate) = confstate
+                            && let Some(sel) = tablestate.selected()
+                                && let Some((active, _field)) = fields.get_mut(sel) {
+                                    *active = !*active;
                                 }
+                    }
+                    _ => {}
+                },
+                GuiState::Normal => match code {
+                    KeyCode::Esc | KeyCode::Char('Q') | KeyCode::Char('q') => {
+                        break Ok(());
+                    }
+                    KeyCode::Delete if state.active_window == Window::Filter => {
+                        if let Some(index) = filter_table_state.selected() {
+                            state.tracepoints.remove(index);
+                            if index >= state.tracepoints.len() {
+                                let new_sel = state.tracepoints.len().checked_sub(1);
+                                state.selected_filter = new_sel;
+                                filter_table_state.select(new_sel);
                             }
+                            state.rebuild_trie();
+                            state.save();
                         }
-
-                        KeyCode::Char('C'|'c') if state.active_window == Window::Filter => {
-                            if let Some(index) = filter_table_state.selected() {
-                                let was_sel = state.capture_sel();
-                                if let Some(tracepoint) = state.tracepoints.get_mut(index) {
-                                    tracepoint.capture = !tracepoint.capture;
-                                    state.rebuild_trie();
-                                    state.restore_sel(
-                                        was_sel,
-                                        &mut output_table_state,
-                                        &mut do_center,
-                                    );
-                                    state.save();
-                                }
-                            }
+                    }
+                    KeyCode::Right | KeyCode::Left => match code {
+                        KeyCode::Right => {
+                            state.sidescroll = state.sidescroll.saturating_add(10);
                         }
-
-                        KeyCode::Char(' ') if state.active_window == Window::Filter => {
-                            if let Some(index) = filter_table_state.selected() {
-                                let was_sel = state.capture_sel();
-                                if let Some(tracepoint) = state.tracepoints.get_mut(index) {
-                                    tracepoint.active = !tracepoint.active;
-                                    state.rebuild_trie();
-                                    state.restore_sel(
-                                        was_sel,
-                                        &mut output_table_state,
-                                        &mut do_center,
-                                    );
-                                    state.save();
-                                }
-                            }
+                        KeyCode::Left => {
+                            state.sidescroll = state.sidescroll.saturating_sub(10);
                         }
-                        KeyCode::Tab => {
-                            state.active_window = state.active_window.next();
-                        }
-                        KeyCode::Char('u'|'U') => {
-                            state.col_sizes.clear();
-                        }
-                        KeyCode::Char('A') | KeyCode::Char('a') => {
-                            let mut text = TextArea::default();
-                            text.set_block(Block::new().borders(Borders::ALL).title("Filter"));
-                            gui_state = GuiState::AddNewFilter(text);
-                        }
-                        KeyCode::Up => match state.active_window {
-                            Window::Filter => {
-                                filter_table_state.select_previous();
-                                state.selected_filter = filter_table_state.selected();
-                            }
-                            Window::Output => {
-                                follow = false;
-                                output_table_state.select_previous();
-                                state.selected_output = output_table_state.selected();
-                            }
-                        },
-                        KeyCode::Down => match state.active_window {
-                            Window::Filter => {
-                                filter_table_state.select_next();
-                                state.selected_filter = filter_table_state.selected();
-                            }
-                            Window::Output => {
-                                output_table_state.select_next();
-                                state.selected_output = output_table_state.selected();
-                            }
-                        },
                         _ => {}
                     },
-                    GuiState::AddNewFilter(text) => match code {
-                        KeyCode::Esc => {
-                            gui_state = GuiState::Normal;
+                    KeyCode::PageDown | KeyCode::PageUp => {
+                        let change = match code {
+                            KeyCode::PageDown => row_space as isize,
+                            KeyCode::PageUp => {
+                                if state.active_window == Window::Output {
+                                    follow = false;
+                                }
+                                -(row_space as isize)},
+                            _ => 0,
+                        };
+                        match state.active_window {
+                            Window::Filter => {}
+                            Window::Output => {
+                                if let Some(selected) = output_table_state.selected() {
+                                    output_table_state
+                                        .select(Some(selected.saturating_add_signed(change)));
+                                } else {
+                                    output_table_state.select(Some(0));
+                                }
+                                state.selected_output = output_table_state.selected();
+                            }
                         }
-                        KeyCode::Enter => {
-                            let fingerprint = text.lines()[0].to_string();
-                            state.add_tracepoint(TracePointData {
-                                fingerprint: Fingerprint::parse(&fingerprint),
-                                tp: TracePoint {
-                                    file: Arc::new(Default::default()),
-                                    line_number: 0,
-                                    tracepoint: u32::MAX,
-                                },
-                                active: true,
-                                capture: false,
-                                negative: false,
-                                matches: AtomicUsize::new(0),
-                            });
-
-                            gui_state = GuiState::Normal;
-                            state.save();
-                        }
-                        _ => {
-                            text.input(event);
+                    }
+                    KeyCode::Home | KeyCode::End => match state.active_window {
+                        Window::Filter => {}
+                        Window::Output => {
+                            match code {
+                                KeyCode::Home => {
+                                    if state.active_window == Window::Output {
+                                        follow = false;
+                                    }
+                                    output_table_state.select(Some(0));
+                                }
+                                KeyCode::End => {
+                                    output_table_state.select(Some(usize::MAX));
+                                }
+                                _ => {}
+                            }
+                            state.selected_output = output_table_state.selected();
                         }
                     },
+                    KeyCode::Pause | KeyCode::Char('s') | KeyCode::Char('S') => {
+                        state.pause = !state.pause;
+                        state.save();
+                    }
+                    KeyCode::Char('I') | KeyCode::Char('i') => {
+                        gui_state = GuiState::Configure(state.get_parsing_configuration());
+                    }
+                    KeyCode::Char('r'|'R') => {
+                        state.raw = !state.raw;
+                        state.reapply_parsing_config();
+                        state.rebuild_matches();
+                        state.save();
+                    }
+                    KeyCode::Char('F') | KeyCode::Char('f') => {
+                        let was_sel = state.capture_sel();
+                        state.do_filter = !state.do_filter;
+                        state.restore_sel(was_sel, &mut output_table_state, &mut do_center);
+                        state.save();
+                    }
+                    KeyCode::Char('O') | KeyCode::Char('o') => {
+                        if let Some(sel) = state
+                            .focus_current_tracepoint(modifiers.contains(KeyModifiers::SHIFT))
+                        {
+                            state.do_filter = true;
+                            output_table_state.select(Some(sel));
+                        }
+                        state.save();
+                    }
+                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                        light_mode = !light_mode;
+                        state.light_mode = Some(light_mode);
+                        color_scheme = ColorScheme::new(light_mode);
+                        color_style = ColorStyle::new(color_scheme);
+                        state.save();
+                    }
+                    KeyCode::Char(key@'+'|key@'-') if state.active_window == Window::Filter => {
+                        if let Some(index) = filter_table_state.selected() {
+                            let was_sel = state.capture_sel();
+                            if let Some(tracepoint) = state.tracepoints.get_mut(index) {
+                                match key {
+                                    '+' => tracepoint.negative = false,
+                                    '-' => tracepoint.negative = true,
+                                    _ => {}
+                                }
+                                state.rebuild_trie();
+                                state.restore_sel(
+                                    was_sel,
+                                    &mut output_table_state,
+                                    &mut do_center,
+                                );
+                                state.save();
+                            }
+                        }
+                    }
+
+                    KeyCode::Char('C'|'c') if state.active_window == Window::Filter => {
+                        if let Some(index) = filter_table_state.selected() {
+                            let was_sel = state.capture_sel();
+                            if let Some(tracepoint) = state.tracepoints.get_mut(index) {
+                                tracepoint.capture = !tracepoint.capture;
+                                state.rebuild_trie();
+                                state.restore_sel(
+                                    was_sel,
+                                    &mut output_table_state,
+                                    &mut do_center,
+                                );
+                                state.save();
+                            }
+                        }
+                    }
+
+                    KeyCode::Char(' ') if state.active_window == Window::Filter => {
+                        if let Some(index) = filter_table_state.selected() {
+                            let was_sel = state.capture_sel();
+                            if let Some(tracepoint) = state.tracepoints.get_mut(index) {
+                                tracepoint.active = !tracepoint.active;
+                                state.rebuild_trie();
+                                state.restore_sel(
+                                    was_sel,
+                                    &mut output_table_state,
+                                    &mut do_center,
+                                );
+                                state.save();
+                            }
+                        }
+                    }
+                    KeyCode::Tab => {
+                        state.active_window = state.active_window.next();
+                    }
+                    KeyCode::Char('u'|'U') => {
+                        state.col_sizes.clear();
+                    }
+                    KeyCode::Char('A') | KeyCode::Char('a') => {
+                        let mut text = TextArea::default();
+                        text.set_block(Block::new().borders(Borders::ALL).title("Filter"));
+                        gui_state = GuiState::AddNewFilter(text);
+                    }
+                    KeyCode::Up => match state.active_window {
+                        Window::Filter => {
+                            filter_table_state.select_previous();
+                            state.selected_filter = filter_table_state.selected();
+                        }
+                        Window::Output => {
+                            follow = false;
+                            output_table_state.select_previous();
+                            state.selected_output = output_table_state.selected();
+                        }
+                    },
+                    KeyCode::Down => match state.active_window {
+                        Window::Filter => {
+                            filter_table_state.select_next();
+                            state.selected_filter = filter_table_state.selected();
+                        }
+                        Window::Output => {
+                            output_table_state.select_next();
+                            state.selected_output = output_table_state.selected();
+                        }
+                    },
+                    _ => {}
                 },
-                _ => {}
-            }
+                GuiState::AddNewFilter(text) => match code {
+                    KeyCode::Esc => {
+                        gui_state = GuiState::Normal;
+                    }
+                    KeyCode::Enter => {
+                        let fingerprint = text.lines()[0].to_string();
+                        state.add_tracepoint(TracePointData {
+                            fingerprint: Fingerprint::parse(&fingerprint),
+                            tp: TracePoint {
+                                file: Arc::new(Default::default()),
+                                line_number: 0,
+                                tracepoint: u32::MAX,
+                            },
+                            active: true,
+                            capture: false,
+                            negative: false,
+                            matches: AtomicUsize::new(0),
+                        });
+
+                        gui_state = GuiState::Normal;
+                        state.save();
+                    }
+                    _ => {
+                        text.input(event);
+                    }
+                },
+            } }
         }
     }
 }

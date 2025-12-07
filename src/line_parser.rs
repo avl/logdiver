@@ -84,14 +84,14 @@ impl<'a> Tokens<'a> {
         if let Some(index) = memchr(b' ', self.s.as_bytes()) {
             let ret = &self.s[..index];
             self.s = &self.s[index + 1..];
-            return Some(ret);
+            Some(ret)
         } else {
             if self.s.is_empty() {
                 return None;
             }
             let ret = self.s;
             self.s = "";
-            return Some(ret);
+            Some(ret)
         }
     }
 }
