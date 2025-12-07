@@ -2,6 +2,10 @@
 name = "logdriller"
 version = "0.1.0"
 edition = "2024"
+description = "tool to visualize application log output in the terminal"
+license = "MIT"
+repository = "https://github.com/avl/logdiver"
+
 
 [dependencies]
 crossterm = "0.29.0"
