@@ -44,9 +44,11 @@ use std::{
     time::{Duration, Instant},
 };
 use std::collections::HashSet;
+use std::sync::mpsc::SyncSender;
 use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use terminal_light::TlError;
 use tui_textarea::TextArea;
+use crate::string_carrier::StringCarrier;
 
 mod line_parser;
 mod trie;
@@ -386,7 +388,6 @@ impl State {
         matching_lines.sort();
         self.matching_lines = matching_lines.into();
 
-        
 
 /*        for row in self.all_lines.par_iter() {
             // Also, add a "recent fingerprints" section in ratatui
@@ -541,26 +542,30 @@ impl State {
 fn mainloop(
     state: &mut State,
     program_lines: &mut mpsc::Receiver<DiverEvent>,
-) -> Result<(bool, u64 /*ms remaining*/)> {
+    string_senders: &mut [SyncSender<StringCarrier>; 2],
+) -> Result<bool/*any change*/> {
     let mut counter = 0;
 
-    const SLICE_MS: u64 = 100;
+    const SLICE_MS: u64 = 50;
     let mut change = false;
 
     let start = Instant::now();
-    //while let Ok(event) = program_lines.recv()
+
     let mut time_remaining = SLICE_MS;
     loop {
         counter += 1;
         if counter > 100 {
             time_remaining = SLICE_MS.saturating_sub(start.elapsed().as_millis() as u64);
             if time_remaining == 0 {
-                return Ok((change, 0));
+                return Ok(change);
             }
         }
         let event = match program_lines.try_recv() {
             Ok(event) => event,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok((change, time_remaining)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                time_remaining = SLICE_MS.saturating_sub(start.elapsed().as_millis() as u64);
+                return Ok(change)
+            },
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 bail!("disconnected");
             }
@@ -572,11 +577,13 @@ fn mainloop(
                 state.add_tracepoint(tp);
                 state.save();
             }
-            DiverEvent::ProgramOutput(lines) => {
-                lines.with_each(|line| {
+            DiverEvent::ProgramOutput(mut lines, channel) => {
+
+                for line in lines.all() {
                     state.total += 1;
                     if state.pause {
-                        return;
+                        state.generation += 1;
+                        continue;
                     }
 
                     state.all_lines.push(&line);
@@ -602,7 +609,9 @@ fn mainloop(
                         state.all_lines.pop_front();
                     }
                     state.generation += 1;
-                });
+                }
+                lines.clear();
+                string_senders[channel].send(lines)?;
             }
         }
     }
@@ -614,20 +623,21 @@ struct ReadManyLines {
 }
 
 impl ReadManyLines {
-    fn append(candidate: &[u8], f: &mut impl FnMut(&str)) {
+    fn append(candidate: &[u8], f: &mut impl FnMut(&str) -> Result<()>) -> Result<()> {
         match String::from_utf8_lossy(candidate) {
             Cow::Borrowed(x) => {
-                f(x);
+                f(x)?;
             }
             Cow::Owned(o) => {
-                f(&o);
+                f(&o)?;
             }
         }
+        Ok(())
     }
     fn read_many_lines<T: Read>(
         &mut self,
         read: &mut BufReader<T>,
-        mut f: impl FnMut(&str),
+        mut f: impl FnMut(&str) -> Result<()>,
     ) -> Result<()> {
         let mut buf = read.fill_buf()?;
         let mut l = 0;
@@ -635,10 +645,10 @@ impl ReadManyLines {
         while let Some(index) = memchr(b'\n', buf) {
             if !self.scratch.is_empty() {
                 self.scratch.extend(&buf[..index]);
-                Self::append(&self.scratch, &mut f);
+                Self::append(&self.scratch, &mut f)?;
                 self.scratch.clear();
             } else {
-                Self::append(&buf[..index], &mut f);
+                Self::append(&buf[..index], &mut f)?;
             }
             buf = &buf[index + 1..];
             l += index + 1;
@@ -657,18 +667,65 @@ impl ReadManyLines {
         Ok(())
     }
 }
+const STRING_DEFAULT_CAP: usize = 200;
+
+const STRINGS_PER_MAGAZINE: usize = 4096;
+const STRING_CARRIER_COUNT: usize = 100;
+mod string_carrier {
+    use crate::{STRINGS_PER_MAGAZINE, STRING_DEFAULT_CAP};
+
+    pub struct StringCarrier {
+        strings: Vec<String>,
+        count: usize,
+    }
+
+
+    impl Default for StringCarrier {
+        fn default() -> Self {
+            StringCarrier {
+                strings: vec![String::with_capacity(STRING_DEFAULT_CAP);STRINGS_PER_MAGAZINE],
+                count: 0
+            }
+        }
+    }
+    impl StringCarrier {
+        pub(crate) fn clear(&mut self) {
+            self.count = 0;
+        }
+        pub(crate) fn any(&self) -> bool {
+            self.count != 0
+        }
+        pub fn full(&self) -> bool {
+            self.count == self.strings.len()
+        }
+        pub fn all(&self) -> &[String] {
+            &self.strings[0..self.count]
+        }
+        pub fn push(&mut self, string: &str) -> Result<(),()> {
+            if self.count == self.strings.len() {
+                return Err(());
+            }
+            let s = &mut self.strings[self.count];
+            s.clear();
+            s.push_str(string);
+            self.count += 1;
+            Ok(())
+        }
+    }
+
+}
 
 fn capturer(
     child_out: impl Read,
     program_lines: mpsc::SyncSender<DiverEvent>,
-    _is_stdout: bool,
+    string_receiver: mpsc::Receiver<StringCarrier>,
+    channel: usize,
 ) -> Result<()> {
-    let mut child_out = BufReader::new(child_out);
+    let mut child_out = BufReader::with_capacity(1_000_000, child_out);
 
     let mut line_buf = ReadManyLines::default();
-
+    let mut string_magazine = None;
     loop {
-        let mut loglines = LogLines::None;
 
         //let mut count = 0;
         line_buf.read_many_lines(&mut child_out, |raw_line| {
@@ -705,8 +762,17 @@ fn capturer(
 
                     //}
                 }*/
-                loglines.append(
-                    line.to_string(), //TODO: Remove allocation!
+
+                if string_magazine.as_ref().map(|x: &StringCarrier|x.full()).unwrap_or(true) {
+                    if let Some(full_magazine) = string_magazine.take() {
+                        program_lines.send(DiverEvent::ProgramOutput(full_magazine, channel)).unwrap();
+                    }
+                    string_magazine = Some(string_receiver.recv()?);
+                }
+                let string_magazine: &mut StringCarrier = string_magazine.as_mut().unwrap();
+                string_magazine.push(line).expect("magazine has capacity");
+                /*loglines.append(
+                    string_to_reuse
                                       /*LogLine {
                                           time: timestamp,
                                           target,
@@ -714,14 +780,18 @@ fn capturer(
                                           message,
                                           fields,
                                       }*/
-                );
+                );*/
+                Ok(())
             }
         })?;
 
-        program_lines
-            .send(DiverEvent::ProgramOutput(loglines))
-            .unwrap();
+        if let Some(magazine) = string_magazine.as_ref() &&
+            magazine.any() {
+            program_lines.send(DiverEvent::ProgramOutput(string_magazine.take().unwrap(), channel)).unwrap();
+
+        }
     }
+
 }
 
 #[derive(Savefile, Debug, Clone)]
@@ -733,7 +803,7 @@ struct TracePoint {
 
 pub enum DiverEvent {
     SourceChanged(TracePointData),
-    ProgramOutput(LogLines),
+    ProgramOutput(StringCarrier, usize/*channel 0 or 1*/),
 }
 enum LogLines {
     None,
@@ -854,21 +924,11 @@ impl Clone for TracePointData {
 
 }
 
-//TODO: Remove
-#[derive(Clone)]
-pub struct LogLine {
-    time: String,
-    target: String,
-    level: String,
-    message: String,
-    fields: String,
-}
-
 pub mod lines {
     use std::cmp::max_by;
     use std::collections::VecDeque;
     use std::ops::{Add, Index, Range};
-    use crate::LogLine;
+
 
     pub fn to_usize(range: Range<u32>) -> Range<usize> {
         range.start as usize..range.end as usize
@@ -1558,16 +1618,22 @@ mod simple_json {
 
 impl ParsingConfiguration {
     pub fn make_analyzer(&self) -> Box<dyn FnMut(&str, &mut VecDeque<Range<u32>>)> {
-        let fields: Vec<_> = self.fields.iter().map(|x| x.to_string()).collect();
+        let fields_strings: Vec<_> = self.fields.iter().map(|x| x.protocol_strings().to_string()).collect();
+        let field_is_raw = self.fields.iter().map(|x|x == &LogField::Raw).collect::<Vec<_>>();
         Box::new(move |input, output| {
             let initial_index = output.len();
-            for _field in fields.iter() {
-                output.push_back(u32::MAX..u32::MAX);
+            for is_raw in field_is_raw.iter() {
+                if *is_raw {
+                    output.push_back(0..input.len() as u32);
+                } else {
+                    output.push_back(u32::MAX..u32::MAX);
+                }
             }
 
-            simple_json::parse(&fields, input, |path, value| {
+            simple_json::parse(&fields_strings, input, |path, value| {
                 output[initial_index + path] = value;
             });
+
         })
     }
 }
@@ -1610,14 +1676,13 @@ impl Ord for Debounced {
 
 const LOGDRILLER_FILE: &str = ".logdriller.bin";
 
-// Code credit: Claude
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars();
 
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
-            // ANSI escape sequence starts with ESC ([)
+            // ANSI escape sequence starts with ESC-[
             if chars.next() == Some('[') {
                 // Skip until we find a letter (the command character)
                 for ch in chars.by_ref() {
@@ -1629,8 +1694,8 @@ fn strip_ansi_codes(s: &str) -> String {
         } else if ch == '\r' || ch == '\x08' {
             // Skip carriage return and backspace
             continue;
-        } else if ch.is_control() && ch != '\n' && ch != '\t' {
-            // Skip other control characters except newline and tab
+        } else if ch.is_control() && ch != '\t' {
+            // Skip other control characters except tab
             continue;
         } else {
             result.push(ch);
@@ -1981,7 +2046,7 @@ fn main() -> Result<()> {
     }
 
     let mut iter = 0;
-    let (diver_events_tx, diver_events_rx) = mpsc::sync_channel(4096);
+    let (diver_events_tx1, diver_events_rx) = mpsc::sync_channel(4096);
 
     loop {
         std::thread::sleep(Duration::from_millis(20));
@@ -1996,7 +2061,7 @@ fn main() -> Result<()> {
                         continue;
                     }
                     stream.write_msg(&"GO".to_string()).unwrap();
-                    let diver_events_tx = diver_events_tx.clone();
+                    let diver_events_tx = diver_events_tx1.clone();
                     std::thread::spawn(move || {
                         loop {
                             let tpdata = stream.read_msg::<TracePointData>().unwrap();
@@ -2049,12 +2114,15 @@ fn main() -> Result<()> {
             )
         })?;
 
-    let diver_events_tx2 = diver_events_tx.clone();
+    let (string_tx1, string_rx1) = mpsc::sync_channel(STRING_CARRIER_COUNT);
+    let (string_tx2, string_rx2) = mpsc::sync_channel(STRING_CARRIER_COUNT);
+
+    let diver_events_tx2 = diver_events_tx1.clone();
     if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || capturer(stdout, diver_events_tx2, true));
+        std::thread::spawn(move || capturer(stdout, diver_events_tx2, string_rx2, 1));
     }
     if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || capturer(stderr, diver_events_tx, false));
+        std::thread::spawn(move || capturer(stderr, diver_events_tx1, string_rx1, 0));
     }
     let child = KillOnDrop(child);
 
@@ -2064,9 +2132,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let mut string_senders = [string_tx1, string_tx2];
+    for _ in 0..STRING_CARRIER_COUNT {
+        for s in string_senders.iter_mut() {
+            s.send(StringCarrier::default()).unwrap();
+        }
+    }
+
     let res = match catch_unwind(AssertUnwindSafe(|| {
         let terminal = ratatui::init();
-        run(terminal, state, child, light_mode, diver_events_rx)
+        run(terminal, state, child, light_mode, diver_events_rx, string_senders)
     })) {
         Ok(err) => err,
         Err(err) => {
@@ -2285,7 +2360,7 @@ pub enum LogField {
 impl LogField {
     fn parse(name: &str) -> LogField {
         match name {
-            "raw" => LogField::Raw,
+            "" => LogField::Raw,
             "time" => LogField::Time,
             "level" => LogField::Severity,
             "target" => LogField::Target,
@@ -2325,12 +2400,40 @@ impl Display for LogField {
     }
 }
 
+impl LogField {
+    fn protocol_strings(&self) -> &str {
+        match self {
+            LogField::Raw => {
+                ""
+            }
+            LogField::Time => {
+                "timestamp"
+            }
+            LogField::Severity => {
+                "level"
+            }
+            LogField::Target => {
+                "target"
+            }
+            LogField::Path => {
+                "path"
+            }
+            LogField::Message => {
+                "message"
+            }
+            LogField::Field(name) => {
+                name.as_str()
+            }
+        }
+    }
+}
 fn run(
     mut terminal: DefaultTerminal,
     mut state: State,
     mut child: KillOnDrop,
     mut light_mode: bool,
     mut program_lines: mpsc::Receiver<DiverEvent>,
+    mut string_senders: [SyncSender<StringCarrier>;2]
 ) -> Result<()> {
     let rows: [Row; 0] = [];
 
@@ -2356,11 +2459,11 @@ fn run(
 
     let mut row_space = 0;
     let mut do_center = false;
+    let mut sleep_time = 50u64;
     loop {
-        let time_remaining; //of slice
+        let change;
         {
-            let change;
-            (change, time_remaining) = mainloop(&mut state, &mut program_lines)?;
+            change = mainloop(&mut state, &mut program_lines, &mut string_senders)?;
             if change {
                 state.generation += 1;
             }
@@ -2731,7 +2834,16 @@ fn run(
                 last_generation = state.generation;
             }
         }
-        if event::poll(Duration::from_millis(time_remaining))? {
+
+        if change {
+            sleep_time = 0;
+        } else {
+            sleep_time = (sleep_time+1).min(50);
+        }
+
+        if event::poll(Duration::from_millis(
+            sleep_time.saturating_sub(10)
+        ))? {
             let event = event::read()?;
 
             if let Event::Key(_) = &event {

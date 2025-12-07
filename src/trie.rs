@@ -50,18 +50,18 @@ impl<K: Debug + Default + Copy + PartialEq, V> TinyMap<K, V> {
         }
     }
     #[inline]
-    fn visit<'a>(&'a self, mut visitor: impl FnMut(K, &'a V) -> bool) -> bool {
+    fn visit<'a>(&'a mut self, mut visitor: impl FnMut(K, &mut V) -> bool) -> bool {
         match self {
             TinyMap::Inline(count, keys, values) => {
                 for i in 0..*count {
-                    if !visitor(keys[i as usize], values[i as usize].as_ref().unwrap()) {
+                    if !visitor(keys[i as usize], values[i as usize].as_mut().unwrap()) {
                         return false;
                     }
                 }
                 true
             }
             TinyMap::Heap(keys, values) => {
-                for (key, val) in keys.iter().zip(values.iter()) {
+                for (key, val) in keys.iter().zip(values.iter_mut()) {
                     if !visitor(*key, val) {
                         return false;
                     }
@@ -224,13 +224,13 @@ enum TrieNode<V> {
     Head {
         map: Box<TinyMap<TrieKey, TrieNode<V>>>,
         value: Option<V>,
-        generation: AtomicU64,
+        generation: u64,
     },
     Tail {
         // Must not be empty
         tail: Vec<TrieKey>,
         value: Option<V>,
-        generation: AtomicU64,
+        generation: u64,
     },
 }
 impl<V:Clone> Clone for TrieNode<V> {
@@ -241,14 +241,14 @@ impl<V:Clone> Clone for TrieNode<V> {
                 TrieNode::Head {
                     map: map.clone(),
                     value: value.clone(),
-                    generation: AtomicU64::new(generation.load(Ordering::Relaxed))
+                    generation: *generation
                 }
             }
             TrieNode::Tail { tail, value, generation } => {
                 TrieNode::Tail {
                     tail: tail.clone(),
                     value: value.clone(),
-                    generation: AtomicU64::new(generation.load(Ordering::Relaxed))
+                    generation: *generation
                 }
             }
         }
@@ -314,11 +314,12 @@ impl MatchSequenceCollector for MatchSequence {
 
 impl<V> TrieNode<V> {
     // return false to stop traversal
+    #[inline]
     pub fn search<'a, M: MatchSequenceCollector>(
-        &'a self,
+        &mut self,
         needle_key: &[u8],
         match_sequence: &mut M,
-        hit: &mut impl FnMut(&'a V, &M) -> bool,
+        hit: &mut impl FnMut(&V, &M) -> bool,
         cur_generation: u64,
     ) -> bool {
         match self {
@@ -328,8 +329,8 @@ impl<V> TrieNode<V> {
                 generation,
             } => {
                 if let Some(v) = value.as_ref() {
-                    if generation.load(Ordering::Relaxed) != cur_generation {
-                        generation.store(cur_generation, Ordering::Relaxed); //TODO: This looks wrong, but it's ok since we never really use tries actually unsynchronized
+                    if *generation != cur_generation {
+                        *generation = cur_generation;
                         if !hit(v, &match_sequence) {
                             return false;
                         }
@@ -362,7 +363,7 @@ impl<V> TrieNode<V> {
                 value: Some(value),
                 generation,
             } => {
-                if generation.load(Ordering::Relaxed) == cur_generation {
+                if *generation == cur_generation {
                     return true;
                 }
 
@@ -373,25 +374,25 @@ impl<V> TrieNode<V> {
                     match_sequence: &mut M,
                     hit: &'_ mut impl FnMut(&'a V, &'_ M) -> bool,
                     value: &'a V,
-                    generation: &AtomicU64,
+                    generation: &mut u64,
                     cur_generation: u64,
                 ) -> bool {
-                    if generation.load(Ordering::Relaxed) == cur_generation {
+                    if *generation == cur_generation {
                         return true;
                     }
                     if tail.is_empty() {
-                        generation.store(cur_generation, Ordering::Relaxed);
+                        *generation = cur_generation;
                         hit(value, match_sequence);
                     } else if let Some(needle) = tail.get(0).cloned() {
                         if !needle.match_index(&key[..], |index| -> bool {
-                            if generation.load(Ordering::Relaxed) == cur_generation {
+                            if *generation == cur_generation {
                                 return true;
                             }
                             let saved = match_sequence.save();
                             match_sequence.add(index as u32);
                             let tail = &tail[1..];
                             if tail.is_empty() {
-                                generation.store(cur_generation, Ordering::Relaxed);
+                                *generation = cur_generation;
                                 if !hit(value, match_sequence) {
                                     return false;
                                 }
@@ -478,7 +479,7 @@ impl<V> TrieNode<V> {
             *self = TrieNode::Head {
                 map: Box::new(TinyMap::new()),
                 value: None,
-                generation: AtomicU64::new(0)
+                generation: 0
             };
             _ = self.push(&old_tail, old_value);
         }
@@ -486,7 +487,7 @@ impl<V> TrieNode<V> {
             *self = TrieNode::Tail {
                 tail: key.to_vec(),
                 value: Some(new_value),
-                generation: AtomicU64::new(0)
+                generation: 0
             };
             return true;
         }
@@ -513,7 +514,7 @@ impl<V> TrieNode<V> {
                         TrieNode::Tail {
                             tail: key[1..].to_vec(),
                             value: Some(new_value),
-                            generation: AtomicU64::new(0)
+                            generation: 0
                         },
                     );
                     true
