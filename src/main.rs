@@ -371,10 +371,9 @@ impl State {
         for (i, tp) in self.tracepoints.iter_mut().enumerate() {
             tp.tp.tracepoint = i as u32;
             if tp.active {
+                Self::add_tracepoint_trie(&mut self.fingerprint_trie, tp);
                 if tp.capture {
                     Self::add_tracepoint_trie(&mut self.capture_fingerprint_trie, tp);
-                } else {
-                    Self::add_tracepoint_trie(&mut self.fingerprint_trie, tp);
                 }
             }
         }
@@ -593,7 +592,6 @@ fn mainloop(
                         continue;
                     }
 
-                    compile_error!(Find all bugs"")
                     let mut ignored = false;
                     state.all_lines.push(&line,
                                          |analyzed|{
@@ -2514,6 +2512,7 @@ fn run(
     let mut row_space = 0;
     let mut do_center = false;
     let mut sleep_time = 50u64;
+    let mut follow = false;
     loop {
         let change;
         {
@@ -2561,7 +2560,9 @@ fn run(
                     let stats_area: Rect = lower_split[0];
                     let filter_area = lower_split[1];
 
-                    row_space = (output_area.height as usize).saturating_sub(3);
+                    row_space = (output_area.height as usize).saturating_sub(
+                        if state.raw {2} else {3}
+                    );
                     let matching_line_count = if state.do_filter {
                         state.matching_lines.len()
                     } else {
@@ -2570,6 +2571,7 @@ fn run(
 
                     let offset;
                     let selected_opt;
+
                     if do_center
                         && let Some(selected) = output_table_state.selected()
                         && selected < matching_line_count
@@ -2579,6 +2581,13 @@ fn run(
                             .saturating_sub(row_space / 2)
                             .min(matching_line_count.saturating_sub(1));
                         *output_table_state.offset_mut() = offset;
+                        selected_opt = output_table_state.selected();
+                    } else if follow && matching_line_count > row_space
+                    {
+                        offset = matching_line_count
+                            .min(matching_line_count.saturating_sub(row_space));
+                        *output_table_state.offset_mut() = offset;
+                        output_table_state.select(Some(matching_line_count-1));
                         selected_opt = output_table_state.selected();
                     } else {
                         if output_table_state.selected().unwrap_or(0) >= matching_line_count {
@@ -2672,6 +2681,7 @@ fn run(
                         }
                     }
                     if state.do_filter {
+                        follow = output_table_state.selected() == state.matching_lines.len().checked_sub(1);
                         for (i, mline) in state
                             .matching_lines
                             .iter()
@@ -2701,6 +2711,7 @@ fn run(
                             );
                         }
                     } else {
+                        follow = output_table_state.selected() == Some(state.all_lines.loglines.len()-1);
                         for (i, line) in state
                             .all_lines
                             .iter()
@@ -2775,7 +2786,7 @@ fn run(
                                 .highlight(Window::Output, state.active_window, &color_style)
                                 .title_bottom(format!(
                                     "{} / {}, R - show raw, F - toggle filter, I - settings, U - autosize",
-                                    selected_opt.map(|x| x.to_string()).unwrap_or_default(),
+                                    selected_opt.map(|x| (x+1).to_string()).unwrap_or_default(),
                                     matching_line_count
                                 )),
                         );
@@ -3002,7 +3013,11 @@ fn run(
                         KeyCode::PageDown | KeyCode::PageUp => {
                             let change = match code {
                                 KeyCode::PageDown => row_space as isize,
-                                KeyCode::PageUp => -(row_space as isize),
+                                KeyCode::PageUp => {
+                                    if state.active_window == Window::Output {
+                                        follow = false;
+                                    }
+                                    -(row_space as isize)},
                                 _ => 0,
                             };
                             match state.active_window {
@@ -3023,6 +3038,9 @@ fn run(
                             Window::Output => {
                                 match code {
                                     KeyCode::Home => {
+                                        if state.active_window == Window::Output {
+                                            follow = false;
+                                        }
                                         output_table_state.select(Some(0));
                                     }
                                     KeyCode::End => {
@@ -3068,11 +3086,15 @@ fn run(
                             color_style = ColorStyle::new(color_scheme);
                             state.save();
                         }
-                        KeyCode::Char('+') if state.active_window == Window::Filter => {
+                        KeyCode::Char(key@'+'|key@'-') if state.active_window == Window::Filter => {
                             if let Some(index) = filter_table_state.selected() {
                                 let was_sel = state.capture_sel();
                                 if let Some(tracepoint) = state.tracepoints.get_mut(index) {
-                                    tracepoint.negative = !tracepoint.negative;
+                                    match key {
+                                        '+' => tracepoint.negative = false,
+                                        '-' => tracepoint.negative = true,
+                                        _ => {}
+                                    }
                                     state.rebuild_trie();
                                     state.restore_sel(
                                         was_sel,
@@ -3132,6 +3154,7 @@ fn run(
                                 state.selected_filter = filter_table_state.selected();
                             }
                             Window::Output => {
+                                follow = false;
                                 output_table_state.select_previous();
                                 state.selected_output = output_table_state.selected();
                             }
