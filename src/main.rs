@@ -2915,6 +2915,11 @@ fn run(
                         KeyCode::Delete if state.active_window == Window::Filter => {
                             if let Some(index) = filter_table_state.selected() {
                                 state.tracepoints.remove(index);
+                                if index >= state.tracepoints.len() {
+                                    let new_sel = state.tracepoints.len().checked_sub(1);
+                                    state.selected_filter = new_sel;
+                                    filter_table_state.select(new_sel);
+                                }
                                 state.rebuild_trie();
                                 state.save();
                             }
