@@ -1,10 +1,7 @@
 use crate::{MatchSequence, Restore};
 use memchr::memchr_iter;
 use savefile::prelude::Savefile;
-use std::{
-    cell::Cell,
-    fmt::{Debug, Formatter}
-};
+use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// This is a little trie-based search structure.

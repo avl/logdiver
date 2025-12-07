@@ -1,6 +1,6 @@
 extern crate core;
 
-use crate::lines::{AnalyzedLogLines, AnalyzedRow, ColumnDefinition, FastLogLines, LogLineId};
+use crate::lines::{AnalyzedLogLines, AnalyzedRow, ColumnDefinition, LogLineId};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use indexmap::{IndexMap, map::Entry};
@@ -19,13 +19,12 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState},
 };
 use savefile::{
-    Deserialize, Deserializer, Field, LittleEndian, Serialize, Serializer,
+    Deserialize, Deserializer, LittleEndian, Serialize, Serializer,
     prelude::{ReadBytesExt, Savefile},
 };
 use std::borrow::Cow;
 use std::ops::{Add, Range};
 use std::panic::AssertUnwindSafe;
-use std::rc::Rc;
 use std::{
     collections::{BinaryHeap, HashMap, VecDeque},
     ffi::OsString,
@@ -45,8 +44,7 @@ use std::{
 };
 use std::collections::HashSet;
 use std::sync::mpsc::SyncSender;
-use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use terminal_light::TlError;
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use tui_textarea::TextArea;
 use crate::string_carrier::StringCarrier;
 
@@ -255,7 +253,7 @@ impl State {
         self.reapply_parsing_config();
     }
     pub(crate) fn reapply_parsing_config(&mut self) {
-        let mut coldef = if !self.raw {ColumnDefinition {
+        let coldef = if !self.raw {ColumnDefinition {
             analyzer: self.config.make_analyzer(),
             col_names: self.config.fields.iter().map(|x| x.to_string()).collect(),
         }} else {
@@ -488,7 +486,7 @@ impl State {
             if self.matching_lines.is_empty() {
                 return None;
             }
-            let mut start = self.selected_output.unwrap_or(if back {
+            let start = self.selected_output.unwrap_or(if back {
                 0
             } else {
                 self.matching_lines.len().saturating_sub(1)
@@ -953,7 +951,7 @@ impl Clone for TracePointData {
 }
 
 pub mod lines {
-    use std::cmp::max_by;
+    
     use std::collections::VecDeque;
     use std::ops::{Add, Index, Range};
 
@@ -1023,7 +1021,7 @@ pub mod lines {
             LogLineId(self.start_id)
         }
 
-        pub fn get<'a>(&'a self, line_id: LogLineId) -> &str {
+        pub fn get<'a>(&'a self, line_id: LogLineId) -> &'a str {
             let offset = line_id.0 - self.start_id;
             &self[offset]
         }
@@ -2083,7 +2081,7 @@ fn main() -> Result<()> {
             state
         })
         .unwrap_or_else(|_e| {
-            let mut t = State::default();
+            let t = State::default();
             //t.plain = true;
             t
         });
@@ -2673,7 +2671,7 @@ fn run(
                         *selected -= offset;
                     }
                     let selected = fixed_output_table_state.selected();
-                    let mut autosize = state.col_sizes.len() != state.all_lines.cols().len();
+                    let autosize = state.col_sizes.len() != state.all_lines.cols().len();
                     if autosize {
                         state.col_sizes.clear();
                         for col in state.all_lines.cols() {
@@ -2739,7 +2737,7 @@ fn run(
                     }
 
 
-                    let mut output_cols = state
+                    let output_cols = state
                         .col_sizes
                         .iter()
                         .map(|x| Constraint::Min(*x))
@@ -2861,7 +2859,7 @@ fn run(
                                 ParsingConfigState::Enabled(fields, tablestate) => {
                                     let mut rows = Vec::new();
                                     for (active, field) in fields {
-                                        let mut row = Row::new([
+                                        let row = Row::new([
                                             Line::raw(if *active {
                                                 "X".to_string()
                                             } else {
@@ -2871,7 +2869,7 @@ fn run(
                                         ]);
                                         rows.push(row);
                                     }
-                                    let mut area = popup_area(
+                                    let area = popup_area(
                                         frame.area(),
                                         75,
                                         30.min(newsize.height.saturating_sub(2)),
