@@ -261,6 +261,15 @@ pub struct Trie<V> {
     generation: AtomicU64,
     match_sequence: MatchSequence,
 }
+impl<V> Trie<V> {
+    pub fn empty_trie(&self) -> bool {
+        match &self.top {
+            TrieNode::Empty => {true}
+            _ => false,
+        }
+    }
+
+}
 impl<V> Clone for Trie<V> where V: Clone{
     fn clone(&self) -> Self {
         Self {

@@ -140,6 +140,8 @@ fn parse_delta(prev: &str, now: &str, path: &Arc<PathBuf>, tx: &Buffer, debug_no
                 fingerprint: Fingerprint(finger),
                 tp,
                 active: line.trim_end().ends_with("//"),
+                capture: false,
+                negative: false,
                 matches: AtomicUsize::new(0),
             };
             tx.push(tp);
@@ -260,7 +262,7 @@ impl State {
             ColumnDefinition {
                 col_names: vec!["".to_string()],
                 analyzer: Box::new(|line,out|{
-                    out.push_back(0..line.len() as u32);
+                    out.push(0..line.len() as u32);
                 }),
             }
         };
@@ -321,21 +323,31 @@ impl State {
     fn check_matching<'a>(
         fingerprint_trie: &mut Trie<TracePoint>,
         trace_point_data: &[TracePointData],
-        row: AnalyzedRow<'a>,
+        row: &AnalyzedRow<'a>,
     ) -> bool {
-        let mut any_hit = false;
+        if fingerprint_trie.empty_trie() {
+            return true;
+        }
+        let mut any_positive_hit = false;
+        let mut any_negative_hit = false;
+
         let len = trace_point_data.iter().filter(|x| x.active).count();
         for item in row.cols() {
             fingerprint_trie.search_fn_fast(
                 item,
                 |hit| {
-                    trace_point_data[hit.tracepoint as usize].matches.fetch_add(1, Ordering::Relaxed);
-                    any_hit = true;
+                    let tp = &trace_point_data[hit.tracepoint as usize];
+                    tp.matches.fetch_add(1, Ordering::Relaxed);
+                    if tp.negative  {
+                        any_negative_hit = true;
+                    } else {
+                        any_positive_hit = true;
+                    }
                 },
                 len,
             );
         }
-        any_hit
+        any_positive_hit && !any_negative_hit
     }
 
     /// Check if 'line' matches the filter, and adds it to the `matching_lines`
@@ -343,7 +355,7 @@ impl State {
         fingerprint_trie: &mut Trie<TracePoint>,
         matching_lines: &mut VecDeque<LogLineId>,
         trace_point_data: &mut [TracePointData],
-        row: AnalyzedRow<'a>,
+        row: &AnalyzedRow<'a>,
     ) {
         let id = row.id();
         if Self::check_matching(fingerprint_trie, trace_point_data, row) {
@@ -355,10 +367,15 @@ impl State {
     }
     fn rebuild_trie(&mut self) {
         self.fingerprint_trie = Trie::new();
+        self.capture_fingerprint_trie = Trie::new();
         for (i, tp) in self.tracepoints.iter_mut().enumerate() {
             tp.tp.tracepoint = i as u32;
             if tp.active {
-                Self::add_tracepoint_trie(&mut self.fingerprint_trie, tp);
+                if tp.capture {
+                    Self::add_tracepoint_trie(&mut self.capture_fingerprint_trie, tp);
+                } else {
+                    Self::add_tracepoint_trie(&mut self.fingerprint_trie, tp);
+                }
             }
         }
 
@@ -379,7 +396,7 @@ impl State {
             ||self.fingerprint_trie.clone(),
             |trie,row|{
                 let id = row.id();
-                if State::check_matching(trie,&self.tracepoints[..], row) {
+                if State::check_matching(trie,&self.tracepoints[..], &row) {
                     id
                 } else {
                     LogLineId::MAX
@@ -418,13 +435,6 @@ impl State {
             }
             prev_tp.active = tp.active;
             drop(tp);
-            if !prev_tp.active {
-                // This tp was inactivated
-                self.rebuild_trie();
-            } else {
-                // This tp was activated
-                Self::add_tracepoint_trie(&mut self.fingerprint_trie, &prev_tp);
-            }
         } else {
             let mut indices: Vec<_> = self.tracepoints.iter().map(|x| x.tp.tracepoint).collect();
             indices.sort();
@@ -435,15 +445,12 @@ impl State {
             };
 
             tp.tp.tracepoint = tp_index;
-            if tp.active {
-                Self::add_tracepoint_trie(&mut self.fingerprint_trie, &tp);
-            }
-
             self.tracepoints.push(tp);
         }
         if !any_active && !self.do_filter {
             self.do_filter = true;
         }
+        self.rebuild_trie();
         self.rebuild_matches();
     }
 
@@ -586,13 +593,32 @@ fn mainloop(
                         continue;
                     }
 
-                    state.all_lines.push(&line);
+                    compile_error!(Find all bugs"")
+                    let mut ignored = false;
+                    state.all_lines.push(&line,
+                                         |analyzed|{
+                                             if !State::check_matching(&mut state.capture_fingerprint_trie, &mut state.tracepoints, &analyzed) {
+                                                 ignored = true;
+                                                 return false;
+                                             }
+                                             true
+                                         }
+                    );
+                    if ignored {
+                        continue;
+                    }
+
+                    let last = state.all_lines.last();
+
+
                     State::add_if_matching(
                         &mut state.fingerprint_trie,
                         &mut state.matching_lines,
                         &mut state.tracepoints,
-                        state.all_lines.last(),
+                        &last
                     );
+                    drop(last);
+
                     if state.all_lines.len() > MAX_LINES {
                         let next_front_id = state.all_lines.loglines.first_id() + 1;
                         if let Some(front) = state.matching_lines.front() {
@@ -910,6 +936,8 @@ pub struct TracePointData {
     fingerprint: Fingerprint,
     tp: TracePoint,
     active: bool,
+    capture: bool,
+    negative: bool,
     matches: AtomicUsize,
 }
 impl Clone for TracePointData {
@@ -918,6 +946,8 @@ impl Clone for TracePointData {
             fingerprint: self.fingerprint.clone(),
             tp:self.tp.clone(),
             active: self.active.clone(),
+            capture: self.capture,
+            negative: self.negative,
             matches: AtomicUsize::new(self.matches.load(Ordering::Relaxed)),
         }
     }
@@ -1028,6 +1058,7 @@ pub mod lines {
             let next_offset = self.start_offset + insert_location;
             self.offsets.push_back(next_offset);
         }
+
         pub fn pop(&mut self) {
             if let Some(first) = self.offsets.pop_front() {
                 assert_eq!(first, self.start_offset);
@@ -1078,7 +1109,7 @@ pub mod lines {
     pub struct ColumnDefinition {
         // columns
         pub col_names: Vec<String>,
-        pub analyzer: Box<dyn FnMut(&str, &mut VecDeque<Range<u32>>)>,
+        pub analyzer: Box<dyn FnMut(&str, &mut Vec<Range<u32>>)>,
     }
 
     pub struct AnalyzedLogLines {
@@ -1086,6 +1117,7 @@ pub mod lines {
         coldef: ColumnDefinition,
         // For each log line, 'cols' number of offsets within said logline
         offsets: VecDeque<Range<u32>>,
+        temp: Vec<Range<u32>>
     }
 
     pub trait VecDequeContExt<T> {
@@ -1114,9 +1146,10 @@ pub mod lines {
                 coldef: ColumnDefinition {
                     col_names: vec!["full".to_string()],
                     analyzer: Box::new(|msg, out| {
-                        out.push_back(0..msg.len() as u32);
+                        out.push(0..msg.len() as u32);
                     }),
                 },
+                temp: vec![],
             }
         }
     }
@@ -1166,17 +1199,35 @@ pub mod lines {
             }
             Some(offset)
         }
-        fn analyze(&mut self, msg: &str) {
+        fn analyze(
+            coldef: &mut ColumnDefinition,
+            offsets: &mut Vec<Range<u32>>,
+            msg: &str) {
+            let n = coldef.col_names.len();
+            offsets.reserve(n);
+            let target = offsets.len() + coldef.col_names.len();
+            (coldef.analyzer)(msg, offsets);
+            while offsets.len() < target {
+                offsets.push(u32::MAX..u32::MAX);
+            }
+        }
+        pub fn push(&mut self, msg: &str, mut check: impl FnMut(AnalyzedRow) -> bool) {
+            self.temp.clear();
+            Self::analyze(&mut self.coldef, &mut self.temp, msg);
+
+            let row = AnalyzedRow {
+                line: msg,
+                indices: &self.temp,
+                line_id: LogLineId(self.loglines.start_id + self.loglines.len()),
+            };
+            if !check(row) {
+                return;
+            }
+
+            self.loglines.push(msg);
+
+            self.offsets.extend(self.temp.drain(..));
             let n = self.coldef.col_names.len();
-            let needed = self.offsets.len() + n;
-            if needed > self.offsets.capacity() {
-                self.offsets.reserve_exact((needed * 2).next_multiple_of(n));
-            }
-            let target = self.offsets.len() + self.coldef.col_names.len();
-            (self.coldef.analyzer)(msg, &mut self.offsets);
-            while self.offsets.len() < target {
-                self.offsets.push_back(u32::MAX..u32::MAX);
-            }
             if last_slice(&self.offsets).len() < n {
                 // element not contiguous
                 debug_assert!(
@@ -1185,17 +1236,17 @@ pub mod lines {
                 );
                 self.offsets.make_contiguous();
             }
+
         }
-        pub fn push(&mut self, msg: &str) {
-            self.loglines.push(msg);
-            self.analyze(msg);
-        }
+
         pub fn update(&mut self, coldef: ColumnDefinition) {
             self.coldef = coldef;
             self.offsets.clear();
+            self.temp.clear();
             for item in self.loglines.iter_values() {
-                (self.coldef.analyzer)(item, &mut self.offsets)
+                (self.coldef.analyzer)(item, &mut self.temp);
             }
+            self.offsets = std::mem::take(&mut self.temp).into();
         }
         pub fn get<'a>(&'a self, index: usize) -> AnalyzedRow<'a> {
             let n = self.coldef.col_names.len();
@@ -1335,6 +1386,9 @@ struct State {
     #[savefile_ignore]
     #[savefile_introspect_ignore]
     fingerprint_trie: Trie<TracePoint>,
+    #[savefile_ignore]
+    #[savefile_introspect_ignore]
+    capture_fingerprint_trie: Trie<TracePoint>,
     #[savefile_ignore]
     #[savefile_introspect_ignore]
     all_lines: AnalyzedLogLines,
@@ -1617,16 +1671,16 @@ mod simple_json {
 }
 
 impl ParsingConfiguration {
-    pub fn make_analyzer(&self) -> Box<dyn FnMut(&str, &mut VecDeque<Range<u32>>)> {
+    pub fn make_analyzer(&self) -> Box<dyn FnMut(&str, &mut Vec<Range<u32>>)> {
         let fields_strings: Vec<_> = self.fields.iter().map(|x| x.protocol_strings().to_string()).collect();
         let field_is_raw = self.fields.iter().map(|x|x == &LogField::Raw).collect::<Vec<_>>();
         Box::new(move |input, output| {
             let initial_index = output.len();
             for is_raw in field_is_raw.iter() {
                 if *is_raw {
-                    output.push_back(0..input.len() as u32);
+                    output.push(0..input.len() as u32);
                 } else {
-                    output.push_back(u32::MAX..u32::MAX);
+                    output.push(u32::MAX..u32::MAX);
                 }
             }
 
@@ -2472,6 +2526,8 @@ fn run(
                 [
                     Constraint::Length(7),
                     Constraint::Length(8),
+                    Constraint::Length(8),
+                    Constraint::Length(8),
                     Constraint::Percentage(100),
                 ],
             )
@@ -2481,7 +2537,7 @@ fn run(
                     .title_bottom("A - Add filter, O - Focus Selected")
                     .highlight(Window::Filter, state.active_window, &color_style),
             )
-            .header(Row::new(vec!["Active", "Matches", "Fingerprint"]))
+            .header(Row::new(vec!["Active", "Negative", "Capture", "Matches", "Filter"]))
             .highlight_symbol(">")
             .style(color_style.default_style);
 
@@ -2753,6 +2809,16 @@ fn run(
                                 } else {
                                     "".to_string()
                                 }),
+                                Line::raw(if tracepoint.negative {
+                                    "X".to_string()
+                                } else {
+                                    "".to_string()
+                                }),
+                                Line::raw(if tracepoint.capture {
+                                    "X".to_string()
+                                } else {
+                                    "".to_string()
+                                }),
                                 Line::raw(tracepoint.matches.load(Ordering::Relaxed).to_string()),
                                 Line::raw(tracepoint.fingerprint.to_string()).set_style(
                                     defstyle()
@@ -3002,6 +3068,38 @@ fn run(
                             color_style = ColorStyle::new(color_scheme);
                             state.save();
                         }
+                        KeyCode::Char('+') if state.active_window == Window::Filter => {
+                            if let Some(index) = filter_table_state.selected() {
+                                let was_sel = state.capture_sel();
+                                if let Some(tracepoint) = state.tracepoints.get_mut(index) {
+                                    tracepoint.negative = !tracepoint.negative;
+                                    state.rebuild_trie();
+                                    state.restore_sel(
+                                        was_sel,
+                                        &mut output_table_state,
+                                        &mut do_center,
+                                    );
+                                    state.save();
+                                }
+                            }
+                        }
+
+                        KeyCode::Char('C'|'c') if state.active_window == Window::Filter => {
+                            if let Some(index) = filter_table_state.selected() {
+                                let was_sel = state.capture_sel();
+                                if let Some(tracepoint) = state.tracepoints.get_mut(index) {
+                                    tracepoint.capture = !tracepoint.capture;
+                                    state.rebuild_trie();
+                                    state.restore_sel(
+                                        was_sel,
+                                        &mut output_table_state,
+                                        &mut do_center,
+                                    );
+                                    state.save();
+                                }
+                            }
+                        }
+
                         KeyCode::Char(' ') if state.active_window == Window::Filter => {
                             if let Some(index) = filter_table_state.selected() {
                                 let was_sel = state.capture_sel();
@@ -3064,6 +3162,8 @@ fn run(
                                     tracepoint: u32::MAX,
                                 },
                                 active: true,
+                                capture: false,
+                                negative: false,
                                 matches: AtomicUsize::new(0),
                             });
 
