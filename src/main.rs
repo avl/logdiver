@@ -1240,8 +1240,8 @@ pub mod lines {
         #[test]
         fn test_analyze() {
             let mut def = AnalyzedLogLines::default();
-            def.push("hello,world");
-            def.push("tjenare,världen");
+            def.push("hello,world",|_|true);
+            def.push("tjenare,världen",|_|true);
             def.update(ColumnDefinition {
                 col_names: vec!["1".to_string(), "2".to_string()],
                 analyzer: Box::new(|msg, out| {
@@ -1249,7 +1249,7 @@ pub mod lines {
                     for sub in msg.split(',') {
                         let prev = index;
                         index += sub.len() as u32 + 1;
-                        out.push_back(prev..index);
+                        out.push(prev..index);
                     }
                 }),
             });
@@ -1258,7 +1258,7 @@ pub mod lines {
             assert_eq!(analyzed[0].line, "hello,world");
             assert_eq!(analyzed[0].indices, &[0..6, 6..12]);
             assert_eq!(analyzed[1].line, "tjenare,världen");
-            assert_eq!(analyzed[1].indices, &[0..8, 8..14]);
+            assert_eq!(analyzed[1].indices, &[0..8, 8..17]);
         }
 
         #[test]
